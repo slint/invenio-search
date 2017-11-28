@@ -22,11 +22,16 @@
 import os
 
 
-def build_index_name(*parts):
-    """Build an index name from parts."""
+def build_index_name(*parts, rm_prefix_level=0):
+    """Build an index name from parts.
+
+    :param parts: Parts that should be combined to make an index name.
+    :param rm_prefix_level: How many levels of index
+        name (levels separated by '-') should be removed from index name.
+    """
     return os.path.splitext('-'.join([
         part for part in parts if part
-    ]))[0]
+    ]))[0].split('-', rm_prefix_level)[rm_prefix_level]
 
 
 def schema_to_index(schema, index_names=None):

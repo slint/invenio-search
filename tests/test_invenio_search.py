@@ -118,7 +118,7 @@ def test_load_entry_point_group(template_entrypoints):
         class ep(object):
 
             name = 'records'
-            module_name = 'data'
+            module_name = 'mock_module.mappings'
 
         yield ep
 

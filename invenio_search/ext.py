@@ -28,7 +28,9 @@ from __future__ import absolute_import, print_function
 
 import json
 import os
+import warnings
 
+from elasticsearch import VERSION as ES_VERSION
 from pkg_resources import iter_entry_points, resource_filename, \
     resource_isdir, resource_listdir
 from werkzeug.utils import cached_property
@@ -73,12 +75,17 @@ class _SearchState(object):
         return {k: v for d in result for k, v in d.items()} \
             if result is not None else {}
 
-    def register_mappings(self, alias, package_name):
+    def register_mappings(self, alias, package_name, remove_prefix=False):
         """Register mappings from a package under given alias.
 
         :param alias: The alias.
         :param package_name: The package name.
+        :param remove_prefix: If `True` remove the first level from the index
+            name (i.e. `v5-records-book-v1.0.0` -> `records-book-v1.0.0`).
+            (Note: This needed for backwards compatibility with ES2)
         """
+        rm_prefix_level = 1 if remove_prefix else 0
+
         def _walk_dir(aliases, *parts):
             root_name = build_index_name(*parts)
             resource_name = os.path.join(*parts)
@@ -89,7 +96,8 @@ class _SearchState(object):
             data = aliases.get(root_name, {})
 
             for filename in resource_listdir(package_name, resource_name):
-                index_name = build_index_name(*(parts + (filename, )))
+                index_name = build_index_name(
+                    *(parts + (filename, )), rm_prefix_level=rm_prefix_level)
                 file_path = os.path.join(resource_name, filename)
 
                 if resource_isdir(package_name, file_path):
@@ -144,7 +152,24 @@ class _SearchState(object):
     def load_entry_point_group_mappings(self, entry_point_group_mappings):
         """Load actions from an entry point group."""
         for ep in iter_entry_points(group=entry_point_group_mappings):
-            self.register_mappings(ep.name, ep.module_name)
+            if ES_VERSION[0] == 2:
+                try:
+                    resource_listdir(ep.module_name, 'v2')
+                    self.register_mappings(
+                        ep.name, ep.module_name + '.v2', remove_prefix=True)
+                except FileNotFoundError:
+                    self.register_mappings(ep.name, ep.module_name)
+                    warnings.warn(
+                        "Having mappings in path which doesn't specify "
+                        "Elasticsearch version is deprecated. "
+                        "Please move your mappings to a subfolder named "
+                        "according to Elasticsearch version which your "
+                        "mappings are intended for. "
+                        "(e.g. '{}/v2/{}')".format(ep.module_name, ep.name),
+                        PendingDeprecationWarning)
+            else:
+                self.register_mappings(ep.name, '{}.v{}'.format(
+                    ep.module_name, ES_VERSION[0]), remove_prefix=True)
 
     def load_entry_point_group_templates(self, entry_point_group_templates):
         """Load actions from an entry point group."""

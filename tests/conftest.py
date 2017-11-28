@@ -109,7 +109,7 @@ def template_entrypoints():
     """
     eps = []
     for idx in range(5):
-        event_type_name = 'data'
+        event_type_name = 'mock_module'
         from pkg_resources import EntryPoint
         entrypoint = EntryPoint(event_type_name, event_type_name)
         entrypoint.load = lambda: lambda: ['templates']

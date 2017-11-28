@@ -38,7 +38,7 @@ from invenio_search.proxies import current_search, current_search_client
 def test_init(app, template_entrypoints):
     """Run client initialization."""
     search = app.extensions['invenio-search']
-    search.register_mappings('records', 'data')
+    search.register_mappings('records', 'mock_module.mappings')
 
     assert 'records' in search.aliases
     assert set(search.aliases['records']) == set([
