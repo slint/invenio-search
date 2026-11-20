@@ -1,0 +1,1036 @@
+# SPDX-FileCopyrightText: 2026 CERN.
+# SPDX-License-Identifier: MIT
+
+"""opensearch-py connection class that stores and searches indices in Postgres.
+
+Instead of sending HTTP requests to a cluster, :class:`ParadeDBConnection`
+answers the OpenSearch REST API calls Invenio makes from a Postgres database
+with the ParadeDB ``pg_search`` extension. All indices share one documents
+table with a BM25 index; index metadata, aliases and templates live in small
+side tables. Requests it cannot answer exactly raise a 400 error rather than
+returning approximate results.
+
+It is meant for small instances (local development, demos, test
+environments), not as a replacement for an OpenSearch cluster.
+"""
+
+import fnmatch
+import json
+import threading
+import time
+import uuid
+from copy import deepcopy
+
+from opensearchpy.connection.base import Connection
+
+from .query import (
+    Aggregations,
+    Fields,
+    Translator,
+    Unsupported,
+    filter_source,
+    leaves,
+)
+from .querystring import ParseError
+
+try:
+    import psycopg2 as psycopg
+except ImportError:  # pragma: no cover
+    import psycopg
+
+SEARCH_KEYS = {
+    "query",
+    "post_filter",
+    "from",
+    "size",
+    "sort",
+    "aggs",
+    "aggregations",
+    "_source",
+    "track_total_hits",
+    "track_scores",
+    "version",
+    "timeout",
+    "explain",
+}
+
+
+class Error(Exception):
+    """An error answered with an OpenSearch-style error response."""
+
+    def __init__(self, status, kind, reason):
+        """Constructor."""
+        super().__init__(reason)
+        self.status, self.kind, self.reason = status, kind, reason
+
+
+def _not_found(name):
+    return Error(404, "index_not_found_exception", f"no such index [{name}]")
+
+
+def _merge(base, extra):
+    """Deep merge ``extra`` into a copy of ``base``."""
+    out = deepcopy(base)
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge(out[key], value)
+        else:
+            out[key] = deepcopy(value)
+    return out
+
+
+def _flat(settings, prefix=""):
+    """Flatten index settings to dotted keys without the ``index.`` prefix."""
+    out = {}
+    for key, value in (settings or {}).items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict):
+            out.update(_flat(value, path + "."))
+        else:
+            out[path[6:] if path.startswith("index.") else path] = value
+    return out
+
+
+def _true(value):
+    return value in (True, "true", "True", 1, "1")
+
+
+class ParadeDBConnection(Connection):
+    """Answer OpenSearch API calls from Postgres with ParadeDB ``pg_search``.
+
+    Enable it with::
+
+        SEARCH_CLIENT_CONFIG = {
+            "connection_class": ParadeDBConnection,
+            "dsn": "postgresql://user:pass@localhost/db",  # optional
+        }
+
+    Without ``dsn`` it uses ``SEARCH_PARADEDB_DSN`` or
+    ``SQLALCHEMY_DATABASE_URI`` from the Flask application config.
+    """
+
+    _ready = set()
+    _ready_lock = threading.Lock()
+    _scrolls = {}
+
+    def __init__(self, dsn=None, schema="invenio_search", **kwargs):
+        """Constructor."""
+        super().__init__(**kwargs)
+        self.dsn = dsn
+        self.schema = schema
+        self.docs = f"{schema}.docs"
+        self._local = threading.local()
+
+    # Connection management
+
+    def _dsn(self):
+        if self.dsn:
+            return self.dsn
+        from flask import current_app
+
+        dsn = (
+            current_app.config.get("SEARCH_PARADEDB_DSN")
+            or current_app.config["SQLALCHEMY_DATABASE_URI"]
+        )
+        scheme, rest = dsn.split("://", 1)
+        return scheme.split("+")[0] + "://" + rest
+
+    def _connect(self):
+        conn = getattr(self._local, "conn", None)
+        if conn is None or conn.closed:
+            conn = psycopg.connect(self._dsn())
+            self._local.conn = conn
+        key = (self._dsn(), self.schema)
+        if key not in self._ready:
+            with self._ready_lock:
+                if key not in self._ready:
+                    self._setup(conn)
+                    self._ready.add(key)
+        return conn
+
+    def _setup(self, conn):
+        s = self.schema
+        with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE")
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {s}.indices ("
+                "name text PRIMARY KEY, mappings jsonb NOT NULL, "
+                "settings jsonb NOT NULL, created bigint NOT NULL)"
+            )
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {s}.aliases ("
+                f"alias text, index text REFERENCES {s}.indices ON DELETE CASCADE, "
+                "PRIMARY KEY (alias, index))"
+            )
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {s}.templates ("
+                "kind text, name text, body jsonb NOT NULL, PRIMARY KEY (kind, name))"
+            )
+            # Like Lucene doc ids, ``seq`` grows on every write; it breaks ties.
+            cur.execute(f"CREATE SEQUENCE IF NOT EXISTS {s}.docs_seq")
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {s}.docs ("
+                "pk bigserial PRIMARY KEY, "
+                f"idx text NOT NULL REFERENCES {s}.indices ON DELETE CASCADE, "
+                "id text NOT NULL, version bigint NOT NULL, "
+                f"seq bigint NOT NULL DEFAULT nextval('{s}.docs_seq'), text text, "
+                "doc jsonb NOT NULL, UNIQUE (idx, id))"
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS docs_bm25 ON {s}.docs "
+                "USING bm25 (pk, text, doc) "
+                "WITH (key_field = 'pk', json_fields = '{\"doc\": {\"fast\": true}}')"
+            )
+        conn.commit()
+
+    def close(self):
+        """Close this thread's database connection."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+
+    # Request dispatch
+
+    def perform_request(
+        self,
+        method,
+        url,
+        params=None,
+        body=None,
+        timeout=None,
+        ignore=(),
+        headers=None,
+    ):
+        """Answer one API request. Returns ``(status, headers, body)``."""
+        start = time.time()
+        path, _, query = url.partition("?")
+        # The client passes some values as bytes, such as ``version_type``.
+        params = {
+            k: v.decode() if isinstance(v, bytes) else v
+            for k, v in (params or {}).items()
+        }
+        for pair in filter(None, query.split("&")):
+            key, _, value = pair.partition("=")
+            params.setdefault(key, value)
+        if isinstance(body, bytes):
+            body = body.decode("utf-8")
+        parts = [p for p in path.split("/") if p]
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                status, data = self._route(cur, method, parts, params, body)
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            if isinstance(exc, Error):
+                status, data = exc.status, self._error(exc)
+            elif isinstance(exc, Unsupported):
+                status = 400
+                data = self._error(
+                    Error(400, "illegal_argument_exception", f"ParadeDB: {exc}")
+                )
+            elif isinstance(exc, (ParseError, ValueError, KeyError, TypeError)):
+                status = 400
+                data = self._error(
+                    Error(400, "search_phase_execution_exception", str(exc))
+                )
+            elif isinstance(exc, psycopg.Error):
+                status = 500
+                data = self._error(Error(500, "exception", str(exc).strip()))
+            else:
+                raise
+        raw = "" if method == "HEAD" or data is None else json.dumps(data)
+        duration = time.time() - start
+        if isinstance(ignore, int):
+            ignore = (ignore,)
+        if not (200 <= status < 300) and status not in ignore:
+            self.log_request_fail(method, url, path, body, duration, status, raw)
+            self._raise_error(status, raw, "application/json")
+        self.log_request_success(method, url, path, body, status, raw, duration)
+        return status, {"content-type": "application/json"}, raw
+
+    @staticmethod
+    def _error(err):
+        cause = {"type": err.kind, "reason": err.reason}
+        return {
+            "error": {**cause, "root_cause": [cause]},
+            "status": err.status,
+        }
+
+    def _route(self, cur, method, parts, params, body):
+        data = json.loads(body) if body and parts[-1:] != ["_bulk"] else {}
+        head = parts[0] if parts else ""
+        if not parts:
+            return 200, self._info()
+        if head == "_cluster" and parts[1:2] == ["health"]:
+            return 200, {"status": "green", "timed_out": False, "number_of_nodes": 1}
+        if head in ("_template", "_index_template", "_component_template"):
+            return self._template(cur, method, head, parts[1:], data)
+        if head == "_aliases":
+            return self._update_aliases(cur, method, data)
+        if head == "_alias":
+            return self._aliases(cur, method, None, parts[1:])
+        if head == "_bulk":
+            return self._bulk(cur, None, body, params)
+        if head == "_search" and parts[1:2] == ["scroll"]:
+            return self._scroll(method, data, params)
+        if head in ("_search", "_count"):
+            parts = ["*"] + parts
+        if head in ("_refresh", "_flush"):
+            return 200, {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+        if head.startswith("_") and parts[0] != "*":
+            raise Unsupported(f"endpoint [/{'/'.join(parts)}]")
+
+        name, rest = parts[0], parts[1:]
+        action = rest[0] if rest else None
+        if action is None:
+            return self._index(cur, method, name, data, params)
+        if action in ("_doc", "_create", "_update"):
+            method = "PUT" if method == "POST" else method
+            return self._document(cur, method, name, action, rest[1:], data, params)
+        if action == "_count":
+            return 200, self._search(cur, name, data, params, count=True)
+        if action == "_search" and params.get("scroll"):
+            size = int(data.get("size", params.get("size", 10)))
+            result = self._search(cur, name, data, params, limit=False)
+            return 200, self._start_scroll(result, size)
+        if action == "_search":
+            return 200, self._search(cur, name, data, params)
+        if action == "_bulk":
+            return self._bulk(cur, name, body, params)
+        if action in ("_refresh", "_flush"):
+            self._resolve(cur, name, params)
+            return 200, {"_shards": {"total": 1, "successful": 1, "failed": 0}}
+        if action in ("_alias", "_aliases"):
+            return self._aliases(cur, method, name, rest[1:])
+        if action == "_mapping":
+            return self._mapping(cur, method, name, rest[1:], data, params)
+        if action == "_settings" and method == "GET":
+            names = self._resolve(cur, name, params)
+            meta = self._meta(cur, names)
+            return 200, {n: {"settings": {"index": meta[n][1]}} for n in names}
+        if action == "_delete_by_query":
+            return 200, self._delete_by_query(cur, name, data, params)
+        raise Unsupported(f"endpoint [{method} /{'/'.join(parts)}]")
+
+    def _info(self):
+        from opensearchpy import VERSION
+
+        return {
+            "name": "paradedb",
+            "cluster_name": "paradedb",
+            "version": {
+                "distribution": "opensearch",
+                "number": ".".join(map(str, VERSION)),
+            },
+            "tagline": "Invenio on ParadeDB",
+        }
+
+    # Index metadata
+
+    def _names(self, cur):
+        cur.execute(f"SELECT name FROM {self.schema}.indices")
+        names = {r[0] for r in cur.fetchall()}
+        cur.execute(f"SELECT alias, index FROM {self.schema}.aliases")
+        aliases = {}
+        for alias, index in cur.fetchall():
+            aliases.setdefault(alias, []).append(index)
+        return names, aliases
+
+    def _resolve(self, cur, expr, params=None, aliases_ok=True):
+        """Resolve an index expression to concrete index names."""
+        params = params or {}
+        names, aliases = self._names(cur)
+        lenient = _true(params.get("ignore_unavailable"))
+        out = []
+        for part in expr.split(","):
+            if part.startswith("-"):
+                excluded = set(fnmatch.filter(names, part[1:]))
+                out = [n for n in out if n not in excluded]
+                continue
+            if part in ("_all", "*"):
+                found = sorted(names)
+            elif "*" in part or "?" in part:
+                found = sorted(fnmatch.filter(names, part))
+                if aliases_ok:
+                    for alias in fnmatch.filter(aliases, part):
+                        found += aliases[alias]
+            elif part in names:
+                found = [part]
+            elif aliases_ok and part in aliases:
+                found = sorted(aliases[part])
+            elif lenient:
+                found = []
+            else:
+                raise _not_found(part)
+            out += [n for n in found if n not in out]
+        return out
+
+    def _meta(self, cur, names):
+        cur.execute(
+            f"SELECT name, mappings, settings FROM {self.schema}.indices "
+            "WHERE name = ANY(%s::text[])",
+            [list(names)],
+        )
+        return {name: (m, s) for name, m, s in cur.fetchall()}
+
+    def _templates_for(self, cur, name):
+        """Mappings, settings and aliases from templates matching ``name``."""
+        cur.execute(f"SELECT kind, name, body FROM {self.schema}.templates")
+        rows = cur.fetchall()
+        components = {n: b for k, n, b in rows if k == "_component_template"}
+        legacy = sorted(
+            (b for k, n, b in rows if k == "_template" and self._matches(b, name)),
+            key=lambda b: b.get("order", 0),
+        )
+        composable = sorted(
+            (
+                b
+                for k, n, b in rows
+                if k == "_index_template" and self._matches(b, name)
+            ),
+            key=lambda b: b.get("priority", 0),
+        )
+        result = {"mappings": {}, "settings": {}, "aliases": {}}
+        if composable:
+            best = composable[-1]
+            for component in best.get("composed_of") or []:
+                result = _merge(
+                    result, (components.get(component) or {}).get("template")
+                )
+            return _merge(result, best.get("template"))
+        for template in legacy:
+            result = _merge(
+                result, {k: template.get(k) or {} for k in result if k in template}
+            )
+        return result
+
+    @staticmethod
+    def _matches(template, name):
+        patterns = template.get("index_patterns") or []
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        return any(fnmatch.fnmatchcase(name, p) for p in patterns)
+
+    def _create(self, cur, name, data):
+        names, aliases = self._names(cur)
+        if name in names or name in aliases:
+            raise Error(
+                400,
+                "resource_already_exists_exception",
+                f"index [{name}] already exists",
+            )
+        spec = _merge(self._templates_for(cur, name), data)
+        cur.execute(
+            f"INSERT INTO {self.schema}.indices VALUES (%s, %s, %s, %s)",
+            [
+                name,
+                json.dumps(spec.get("mappings") or {}),
+                json.dumps(_flat(spec.get("settings"))),
+                int(time.time() * 1000),
+            ],
+        )
+        for alias in spec.get("aliases") or {}:
+            cur.execute(
+                f"INSERT INTO {self.schema}.aliases VALUES (%s, %s)", [alias, name]
+            )
+
+    def _index(self, cur, method, name, data, params):
+        if method == "PUT":
+            self._create(cur, name, data)
+            return 200, {
+                "acknowledged": True,
+                "shards_acknowledged": True,
+                "index": name,
+            }
+        if method == "HEAD":
+            names, aliases = self._names(cur)
+            if "*" in name or "," in name:
+                return (200 if self._resolve(cur, name, params) else 404), None
+            return (200 if name in names or name in aliases else 404), None
+        if method == "DELETE":
+            for index in self._resolve(cur, name, params, aliases_ok=False):
+                cur.execute(
+                    f"DELETE FROM {self.schema}.indices WHERE name = %s", [index]
+                )
+            return 200, {"acknowledged": True}
+        if method == "GET":
+            names = self._resolve(cur, name, params)
+            meta = self._meta(cur, names)
+            _, aliases = self._names(cur)
+            return 200, {
+                n: {
+                    "aliases": {a: {} for a, idx in aliases.items() if n in idx},
+                    "mappings": meta[n][0],
+                    "settings": {"index": meta[n][1]},
+                }
+                for n in names
+            }
+        raise Unsupported(f"[{method}] on an index")
+
+    def _template(self, cur, method, kind, rest, data):
+        if not rest:
+            raise Unsupported(f"[{method} /{kind}] without a name")
+        name = rest[0]
+        table = f"{self.schema}.templates"
+        if method in ("PUT", "POST"):
+            cur.execute(
+                f"INSERT INTO {table} VALUES (%s, %s, %s) ON CONFLICT (kind, name) "
+                "DO UPDATE SET body = EXCLUDED.body",
+                [kind, name, json.dumps(data)],
+            )
+            return 200, {"acknowledged": True}
+        cur.execute(f"SELECT name, body FROM {table} WHERE kind = %s", [kind])
+        found = [(n, b) for n, b in cur.fetchall() if fnmatch.fnmatchcase(n, name)]
+        if method == "HEAD":
+            return (200 if found else 404), None
+        if not found:
+            raise Error(404, "resource_not_found_exception", f"[{name}] missing")
+        if method == "DELETE":
+            for n, _ in found:
+                cur.execute(
+                    f"DELETE FROM {table} WHERE kind = %s AND name = %s", [kind, n]
+                )
+            return 200, {"acknowledged": True}
+        if kind == "_template":
+            return 200, dict(found)
+        key = kind[1:] + "s"
+        return 200, {
+            key: [{"name": n, kind[1:]: b} for n, b in found],
+        }
+
+    def _aliases(self, cur, method, index, rest):
+        alias = rest[0] if rest else None
+        table = f"{self.schema}.aliases"
+        if method in ("PUT", "POST"):
+            for name in self._resolve(cur, index, aliases_ok=False):
+                for a in alias.split(","):
+                    cur.execute(
+                        f"INSERT INTO {table} VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                        [a, name],
+                    )
+            return 200, {"acknowledged": True}
+        _, aliases = self._names(cur)
+        indices = set(self._resolve(cur, index)) if index else None
+        patterns = alias.split(",") if alias and alias not in ("_all", "*") else None
+        pairs = [
+            (a, i)
+            for a, idx in aliases.items()
+            for i in idx
+            if (indices is None or i in indices)
+            and (patterns is None or any(fnmatch.fnmatchcase(a, p) for p in patterns))
+        ]
+        if method == "DELETE":
+            if not pairs:
+                raise Error(404, "aliases_not_found_exception", f"[{alias}] missing")
+            for a, i in pairs:
+                cur.execute(
+                    f"DELETE FROM {table} WHERE alias = %s AND index = %s", [a, i]
+                )
+            return 200, {"acknowledged": True}
+        if method == "HEAD":
+            return (200 if pairs else 404), None
+        if patterns and not pairs:
+            raise Error(404, "aliases_not_found_exception", f"alias [{alias}] missing")
+        out = {i: {"aliases": {}} for i in (indices or [])}
+        for a, i in pairs:
+            out.setdefault(i, {"aliases": {}})["aliases"][a] = {}
+        return 200, out
+
+    def _update_aliases(self, cur, method, data):
+        if method != "POST":
+            return self._aliases(cur, method, None, [])
+        for action in data.get("actions") or []:
+            ((op, spec),) = action.items()
+            indices = spec.get("indices") or [spec.get("index")]
+            aliases = spec.get("aliases") or [spec.get("alias")]
+            for index in indices:
+                if op == "remove_index":
+                    self._index(cur, "DELETE", index, {}, {})
+                    continue
+                for alias in aliases:
+                    self._aliases(
+                        cur, "PUT" if op == "add" else "DELETE", index, [alias]
+                    )
+        return 200, {"acknowledged": True}
+
+    def _mapping(self, cur, method, name, rest, data, params):
+        names = self._resolve(cur, name, params)
+        meta = self._meta(cur, names)
+        if method == "PUT":
+            for n in names:
+                cur.execute(
+                    f"UPDATE {self.schema}.indices SET mappings = %s WHERE name = %s",
+                    [json.dumps(_merge(meta[n][0], data)), n],
+                )
+            return 200, {"acknowledged": True}
+        if rest[:1] == ["field"]:
+            wanted = rest[1].split(",")
+            out = {}
+            for n in names:
+                fields = Fields([meta[n][0]])
+                found = {}
+                for field in wanted:
+                    for full in fnmatch.filter(fields.map, field):
+                        spec = self._field_spec(meta[n][0], full)
+                        if spec is not None:
+                            leaf = full.rsplit(".", 1)[-1]
+                            found[full] = {"full_name": full, "mapping": {leaf: spec}}
+                out[n] = {"mappings": found}
+            return 200, out
+        return 200, {n: {"mappings": meta[n][0]} for n in names}
+
+    @staticmethod
+    def _field_spec(mapping, path):
+        node = {"properties": mapping.get("properties") or {}}
+        for segment in path.split("."):
+            props = node.get("properties") or {}
+            if segment in props:
+                node = props[segment]
+            elif segment in (node.get("fields") or {}):
+                node = node["fields"][segment]
+            else:
+                return None
+        return node
+
+    # Documents
+
+    def _write_index(self, cur, name, cache):
+        """Resolve the concrete index a write to ``name`` goes to."""
+        if name in cache:
+            return cache[name]
+        names, aliases = self._names(cur)
+        if name in names:
+            index = name
+        elif name in aliases:
+            if len(aliases[name]) != 1:
+                raise Error(
+                    400,
+                    "illegal_argument_exception",
+                    f"alias [{name}] has more than one index",
+                )
+            index = aliases[name][0]
+        else:
+            self._create(cur, name, {})
+            index = name
+        mappings, settings = self._meta(cur, [index])[index]
+        cache[name] = (index, self._text_spec(mappings, settings))
+        return cache[name]
+
+    @staticmethod
+    def _text_spec(mappings, settings):
+        """Document paths whose values go into the catch-all text column."""
+        default = settings.get("query.default_field")
+        if not default or default == "*" or default == ["*"]:
+            return None
+        if isinstance(default, str):
+            default = [default]
+        fields = Fields([mappings])
+        return {fields.resolve(f)[0] for f in default}
+
+    @staticmethod
+    def _text(doc, spec):
+        values = []
+        for path, value in leaves(doc):
+            if isinstance(value, bool) or value is None:
+                continue
+            if (
+                spec is None
+                or path in spec
+                or any(fnmatch.fnmatchcase(path, p) for p in spec if "*" in p)
+            ):
+                values.append(str(value))
+        return "\n".join(values)
+
+    def _put(self, cur, index, spec, doc_id, doc, version, version_type, op):
+        """Store a document. Returns ``(status, result, version)``."""
+        cur.execute(
+            f"SELECT version FROM {self.docs} WHERE idx = %s AND id = %s FOR UPDATE",
+            [index, doc_id],
+        )
+        row = cur.fetchone()
+        current = row[0] if row else None
+        if op == "create" and current is not None:
+            raise Error(
+                409,
+                "version_conflict_engine_exception",
+                f"[{doc_id}]: document already exists",
+            )
+        if version_type in ("external", "external_gte"):
+            version = int(version)
+            if current is not None and (
+                version < current or (version_type == "external" and version == current)
+            ):
+                raise Error(
+                    409,
+                    "version_conflict_engine_exception",
+                    f"[{doc_id}]: version conflict, current version [{current}] "
+                    f"is higher or equal to the one provided [{version}]",
+                )
+        else:
+            version = (current or 0) + 1
+        cur.execute(
+            f"INSERT INTO {self.docs} (idx, id, version, text, doc) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idx, id) DO UPDATE SET "
+            "version = EXCLUDED.version, text = EXCLUDED.text, doc = EXCLUDED.doc, "
+            f"seq = nextval('{self.schema}.docs_seq')",
+            [index, doc_id, version, self._text(doc, spec), json.dumps(doc)],
+        )
+        if current is None:
+            return 201, "created", version
+        return 200, "updated", version
+
+    def _delete(self, cur, index, doc_id, version, version_type):
+        cur.execute(
+            f"SELECT version FROM {self.docs} WHERE idx = %s AND id = %s FOR UPDATE",
+            [index, doc_id],
+        )
+        row = cur.fetchone()
+        if row is None:
+            return 404, "not_found", int(version or 1)
+        if version_type in ("external", "external_gte") and int(version) < row[0]:
+            raise Error(
+                409,
+                "version_conflict_engine_exception",
+                f"[{doc_id}]: version conflict, current version [{row[0]}] "
+                f"is higher than the one provided [{version}]",
+            )
+        cur.execute(
+            f"DELETE FROM {self.docs} WHERE idx = %s AND id = %s", [index, doc_id]
+        )
+        new = (
+            int(version)
+            if version_type in ("external", "external_gte")
+            else (row[0] + 1)
+        )
+        return 200, "deleted", new
+
+    @staticmethod
+    def _doc_result(index, doc_id, status, result, version):
+        return {
+            "_index": index,
+            "_id": doc_id,
+            "_version": version,
+            "result": result,
+            "_shards": {"total": 1, "successful": 1, "failed": 0},
+            "_seq_no": 0,
+            "_primary_term": 1,
+        }
+
+    def _document(self, cur, method, name, action, rest, data, params):
+        doc_id = rest[0] if rest else uuid.uuid4().hex
+        version, version_type = params.get("version"), params.get("version_type")
+        if method in ("GET", "HEAD"):
+            indices = self._resolve(cur, name, params)
+            cur.execute(
+                f"SELECT idx, version, doc FROM {self.docs} "
+                "WHERE idx = ANY(%s::text[]) AND id = %s",
+                [indices, doc_id],
+            )
+            row = cur.fetchone()
+            if method == "HEAD":
+                return (200 if row else 404), None
+            if row is None:
+                return 404, {"_index": name, "_id": doc_id, "found": False}
+            return 200, {
+                "_index": row[0],
+                "_id": doc_id,
+                "_version": row[1],
+                "_seq_no": 0,
+                "_primary_term": 1,
+                "found": True,
+                "_source": filter_source(row[2], self._source_param(params)),
+            }
+        if method == "DELETE":
+            index = self._resolve(cur, name, params)
+            if len(index) != 1:
+                raise _not_found(name)
+            status, result, v = self._delete(
+                cur, index[0], doc_id, version, version_type
+            )
+            return status, self._doc_result(index[0], doc_id, status, result, v)
+        index, spec = self._write_index(cur, name, {})
+        if action == "_update":
+            doc = self._updated(cur, index, doc_id, data)
+            status, result, v = self._put(
+                cur, index, spec, doc_id, doc, None, None, "index"
+            )
+        else:
+            op = (
+                "create"
+                if action == "_create" or params.get("op_type") == "create"
+                else "index"
+            )
+            status, result, v = self._put(
+                cur, index, spec, doc_id, data, version, version_type, op
+            )
+        return status, self._doc_result(index, doc_id, status, result, v)
+
+    def _updated(self, cur, index, doc_id, data):
+        if "script" in data:
+            raise Unsupported("scripted updates")
+        cur.execute(
+            f"SELECT doc FROM {self.docs} WHERE idx = %s AND id = %s", [index, doc_id]
+        )
+        row = cur.fetchone()
+        if row is None:
+            if data.get("doc_as_upsert"):
+                return data.get("doc") or {}
+            if "upsert" in data:
+                return data["upsert"]
+            raise Error(404, "document_missing_exception", f"[{doc_id}]: missing")
+        return _merge(row[0], data.get("doc"))
+
+    def _bulk(self, cur, default_index, body, params):
+        lines = [json.loads(line) for line in (body or "").splitlines() if line.strip()]
+        items, errors, cache, i = [], False, {}, 0
+        while i < len(lines):
+            ((op, meta),) = lines[i].items()
+            source = None
+            if op != "delete":
+                source = lines[i + 1]
+                i += 1
+            i += 1
+            name = meta.get("_index") or default_index
+            doc_id = meta.get("_id") or uuid.uuid4().hex
+            version = meta.get("version", meta.get("_version"))
+            version_type = meta.get("version_type", meta.get("_version_type"))
+            cur.execute("SAVEPOINT bulk_item")
+            try:
+                if op == "delete":
+                    indices = self._resolve(cur, name)
+                    index = indices[0]
+                    status, result, v = self._delete(
+                        cur, index, doc_id, version, version_type
+                    )
+                else:
+                    index, spec = self._write_index(cur, name, cache)
+                    if op == "update":
+                        source = self._updated(cur, index, doc_id, source)
+                        version, version_type = None, None
+                    status, result, v = self._put(
+                        cur, index, spec, doc_id, source, version, version_type, op
+                    )
+                item = self._doc_result(index, doc_id, status, result, v)
+                item["status"] = status
+                cur.execute("RELEASE SAVEPOINT bulk_item")
+            except Error as err:
+                cur.execute("ROLLBACK TO SAVEPOINT bulk_item")
+                errors = True
+                status = err.status
+                item = {
+                    "_index": name,
+                    "_id": doc_id,
+                    "status": err.status,
+                    "error": {"type": err.kind, "reason": err.reason},
+                }
+            items.append({op: item})
+        return 200, {"took": 0, "errors": errors, "items": items}
+
+    # Search
+
+    @staticmethod
+    def _source_param(params, body=None):
+        if body and "_source" in body:
+            return body["_source"]
+        includes = params.get("_source_includes") or params.get("_source")
+        excludes = params.get("_source_excludes")
+        if includes in ("true", "false"):
+            return includes == "true"
+        if not includes and not excludes:
+            return None
+        return {
+            "includes": includes.split(",") if includes else [],
+            "excludes": excludes.split(",") if excludes else [],
+        }
+
+    def _search(self, cur, expr, body, params, count=False, limit=True):
+        unknown = set(body) - SEARCH_KEYS
+        if unknown:
+            raise Unsupported(f"search options {sorted(unknown)}")
+        if params.get("q"):
+            body = {**body, "query": {"query_string": {"query": params["q"]}}}
+        if not _true(params.get("ignore_unavailable")) and "*" not in expr:
+            self._resolve(cur, expr, params)
+        names = self._resolve(cur, expr, {"ignore_unavailable": "true"})
+        meta = self._meta(cur, names)
+        fields = Fields([m for m, _ in meta.values()])
+        slots = {}
+        tr = Translator(
+            fields,
+            self.docs,
+            percolate=lambda field, docs: self._percolate(
+                cur, names, meta, field, docs, slots
+            ),
+        )
+        cond = tr.where(body.get("query"))
+        where_sql = f"d.idx = ANY(%s::text[]) AND COALESCE({cond[0]}, FALSE)"
+        where_params = [names] + cond[1]
+
+        cur.execute(
+            f"SELECT count(*) FROM {self.docs} d WHERE {where_sql}", where_params
+        )
+        total = cur.fetchone()[0]
+        shards = {"total": 1, "successful": 1, "skipped": 0, "failed": 0}
+        if count:
+            return {"count": total, "_shards": shards}
+
+        aggs_spec = body.get("aggs") or body.get("aggregations")
+        aggregations = None
+        if aggs_spec:
+            aggs = Aggregations(tr, aggs_spec)
+            select, select_params, keys = aggs.select()
+            cur.execute(
+                f"SELECT {select} FROM {self.docs} d WHERE {where_sql}",
+                select_params + where_params,
+            )
+            rows = [dict(zip(keys, row)) for row in cur.fetchall()]
+            aggregations = aggs.compute(rows)
+
+        if body.get("post_filter"):
+            post = tr.where(body["post_filter"], scoring=False)
+            where_sql += f" AND COALESCE({post[0]}, FALSE)"
+            where_params += post[1]
+            cur.execute(
+                f"SELECT count(*) FROM {self.docs} d WHERE {where_sql}", where_params
+            )
+            total = cur.fetchone()[0]
+
+        size = int(body.get("size", params.get("size", 10)))
+        frm = int(body.get("from", params.get("from", 0)))
+        order_sql, order_params, by_score = tr.order_by(body.get("sort"))
+        with_score = by_score or _true(body.get("track_scores"))
+        ctes, joins, score_params = [], [], []
+        if with_score and tr.scoring:
+            for n, (expr_sql, p) in enumerate(tr.scoring):
+                ctes.append(
+                    f"s{n} AS (SELECT pk, paradedb.score(pk) AS sc FROM {self.docs} "
+                    f"WHERE pk @@@ {expr_sql})"
+                )
+                joins.append(f"LEFT JOIN s{n} ON s{n}.pk = d.pk")
+                score_params += p
+            score = " + ".join(f"COALESCE(s{n}.sc, 0)" for n in range(len(ctes)))
+        else:
+            score = "1.0" if with_score else "NULL::real"
+        sql = (
+            ("WITH " + ", ".join(ctes) + " " if ctes else "")
+            + f"SELECT d.pk, d.idx, d.id, d.version, d.doc, ({score})::float AS score "
+            f"FROM {self.docs} d {' '.join(joins)} WHERE {where_sql} "
+            f"ORDER BY {order_sql}"
+        )
+        sql_params = score_params + where_params + order_params
+        if limit:
+            sql += " LIMIT %s OFFSET %s"
+            sql_params += [size, frm]
+        cur.execute(sql, sql_params)
+        version = _true(params.get("version")) or body.get("version") is True
+        source = self._source_param(params, body)
+        hits = []
+        for pk, idx, doc_id, v, doc, sc in cur.fetchall():
+            hit = {"_index": idx, "_id": doc_id, "_score": sc}
+            if version:
+                hit["_version"] = v
+            src = filter_source(doc, source)
+            if src is not None:
+                hit["_source"] = src
+            if pk in slots:
+                hit["fields"] = {"_percolator_document_slot": slots[pk]}
+            hits.append(hit)
+        scores = [h["_score"] for h in hits if h["_score"] is not None]
+        result = {
+            "took": 0,
+            "timed_out": False,
+            "_shards": shards,
+            "hits": {
+                "total": {"value": total, "relation": "eq"},
+                "max_score": max(scores) if scores else None,
+                "hits": hits,
+            },
+        }
+        if aggregations is not None:
+            result["aggregations"] = aggregations
+        return result
+
+    def _percolate(self, cur, names, meta, field, documents, slots):
+        """Run stored queries against ``documents``; returns matching query rows."""
+        matched = []
+        cur.execute("SAVEPOINT percolate")
+        try:
+            for name in names:
+                mappings, settings = meta[name]
+                fields = Fields([mappings])
+                if fields.resolve(field)[1] != "percolator":
+                    continue
+                spec = self._text_spec(mappings, settings)
+                temp = []
+                for slot, doc in enumerate(documents):
+                    cur.execute(
+                        f"INSERT INTO {self.docs} (idx, id, version, text, doc) "
+                        "VALUES (%s, %s, 1, %s, %s) RETURNING pk",
+                        [
+                            name,
+                            f"_percolate-{slot}",
+                            self._text(doc, spec),
+                            json.dumps(doc),
+                        ],
+                    )
+                    temp.append(cur.fetchone()[0])
+                cur.execute(
+                    f"SELECT pk, doc -> %s FROM {self.docs} "
+                    "WHERE idx = %s AND doc ? %s AND NOT (pk = ANY(%s::bigint[]))",
+                    [field, name, field, temp],
+                )
+                for pk, stored in cur.fetchall():
+                    cond = Translator(fields, self.docs).where(stored)
+                    cur.execute(
+                        f"SELECT d.pk FROM {self.docs} d "
+                        f"WHERE d.pk = ANY(%s::bigint[]) AND COALESCE({cond[0]}, FALSE)",
+                        [temp] + cond[1],
+                    )
+                    hit_slots = sorted(temp.index(r[0]) for r in cur.fetchall())
+                    if hit_slots:
+                        matched.append(pk)
+                        slots[pk] = hit_slots
+        finally:
+            cur.execute("ROLLBACK TO SAVEPOINT percolate")
+        return matched
+
+    def _scroll(self, method, data, params):
+        ids = data.get("scroll_id") or params.get("scroll_id")
+        if method == "DELETE":
+            ids = [ids] if isinstance(ids, str) else ids or []
+            freed = sum(self._scrolls.pop(i, None) is not None for i in ids)
+            return 200, {"succeeded": True, "num_freed": freed}
+        state = self._scrolls.get(ids)
+        if state is None:
+            raise Error(
+                404, "search_context_missing_exception", f"No search context [{ids}]"
+            )
+        result, pos, size = state
+        page = deepcopy({k: v for k, v in result.items() if k != "aggregations"})
+        page["hits"]["hits"] = result["hits"]["hits"][pos : pos + size]
+        page["_scroll_id"] = ids
+        self._scrolls[ids] = (result, pos + size, size)
+        return 200, page
+
+    def _start_scroll(self, result, size):
+        scroll_id = uuid.uuid4().hex
+        self._scrolls[scroll_id] = (result, size, size)
+        page = deepcopy(result)
+        page["hits"]["hits"] = result["hits"]["hits"][:size]
+        page["_scroll_id"] = scroll_id
+        return page
+
+    def _delete_by_query(self, cur, name, data, params):
+        result = self._search(
+            cur, name, {"query": data.get("query")}, params, limit=False
+        )
+        for hit in result["hits"]["hits"]:
+            cur.execute(
+                f"DELETE FROM {self.docs} WHERE idx = %s AND id = %s",
+                [hit["_index"], hit["_id"]],
+            )
+        n = len(result["hits"]["hits"])
+        return {"took": 0, "timed_out": False, "total": n, "deleted": n, "failures": []}
