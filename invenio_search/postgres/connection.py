@@ -3,18 +3,19 @@
 
 """opensearch-py connection class that stores and searches indices in Postgres.
 
-Instead of sending HTTP requests to a cluster, :class:`ParadeDBConnection`
-answers the OpenSearch REST API calls Invenio makes from a Postgres database
-with the ParadeDB ``pg_search`` extension. All indices share one documents
-table with a BM25 index; index metadata, aliases and templates live in small
-side tables. Requests it cannot answer exactly raise a 400 error rather than
-returning approximate results.
+Instead of sending HTTP requests to a cluster, :class:`PostgresConnection`
+answers the OpenSearch REST API calls Invenio makes from a Postgres database.
+All indices share one documents table and its postings and norms tables;
+index metadata, aliases and templates live in small side tables. Requests it
+cannot answer exactly raise a 400 error rather than returning approximate
+results.
 
 It is meant for small instances (local development, demos, test
 environments), not as a replacement for an OpenSearch cluster.
 """
 
 import fnmatch
+import functools
 import json
 import threading
 import time
@@ -23,15 +24,20 @@ from copy import deepcopy
 
 from opensearchpy.connection.base import Connection
 
+from .lucene import encode_norm, f32, shard_of
 from .query import (
+    EPOCH,
     Aggregations,
     Fields,
     Translator,
     Unsupported,
+    _listify,
     filter_source,
-    leaves,
+    parse_date,
 )
 from .querystring import ParseError
+from .schema import DATES, KEYWORD_LIKE, NUMERIC, DynamicError, Schema, values_at
+from .scoring import Searcher
 
 try:
     import psycopg2 as psycopg
@@ -52,7 +58,10 @@ SEARCH_KEYS = {
     "version",
     "timeout",
     "explain",
+    "search_after",
 }
+LONG_MAX = 2**63 - 1
+LONG_MIN = -(2**63)
 
 
 class Error(Exception):
@@ -95,17 +104,17 @@ def _true(value):
     return value in (True, "true", "True", 1, "1")
 
 
-class ParadeDBConnection(Connection):
-    """Answer OpenSearch API calls from Postgres with ParadeDB ``pg_search``.
+class PostgresConnection(Connection):
+    """Answer OpenSearch API calls from Postgres.
 
     Enable it with::
 
         SEARCH_CLIENT_CONFIG = {
-            "connection_class": ParadeDBConnection,
+            "connection_class": PostgresConnection,
             "dsn": "postgresql://user:pass@localhost/db",  # optional
         }
 
-    Without ``dsn`` it uses ``SEARCH_PARADEDB_DSN`` or
+    Without ``dsn`` it uses ``SEARCH_POSTGRES_DSN`` or
     ``SQLALCHEMY_DATABASE_URI`` from the Flask application config.
     """
 
@@ -129,7 +138,7 @@ class ParadeDBConnection(Connection):
         from flask import current_app
 
         dsn = (
-            current_app.config.get("SEARCH_PARADEDB_DSN")
+            current_app.config.get("SEARCH_POSTGRES_DSN")
             or current_app.config["SQLALCHEMY_DATABASE_URI"]
         )
         scheme, rest = dsn.split("://", 1)
@@ -151,7 +160,6 @@ class ParadeDBConnection(Connection):
     def _setup(self, conn):
         s = self.schema
         with conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE")
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS {s}.indices ("
@@ -173,14 +181,27 @@ class ParadeDBConnection(Connection):
                 f"CREATE TABLE IF NOT EXISTS {s}.docs ("
                 "pk bigserial PRIMARY KEY, "
                 f"idx text NOT NULL REFERENCES {s}.indices ON DELETE CASCADE, "
-                "id text NOT NULL, version bigint NOT NULL, "
-                f"seq bigint NOT NULL DEFAULT nextval('{s}.docs_seq'), text text, "
+                "id text NOT NULL, version bigint NOT NULL, shard int NOT NULL, "
+                f"seq bigint NOT NULL DEFAULT nextval('{s}.docs_seq'), "
                 "doc jsonb NOT NULL, UNIQUE (idx, id))"
             )
+            # The inverted index: one row per field, term and document.
             cur.execute(
-                f"CREATE INDEX IF NOT EXISTS docs_bm25 ON {s}.docs "
-                "USING bm25 (pk, text, doc) "
-                "WITH (key_field = 'pk', json_fields = '{\"doc\": {\"fast\": true}}')"
+                f"CREATE TABLE IF NOT EXISTS {s}.terms ("
+                f"pk bigint NOT NULL REFERENCES {s}.docs ON DELETE CASCADE, "
+                "field text NOT NULL, term text NOT NULL, freq int NOT NULL, "
+                "positions jsonb)"
+            )
+            cur.execute(
+                f"CREATE INDEX IF NOT EXISTS terms_term ON {s}.terms (field, term)"
+            )
+            cur.execute(f"CREATE INDEX IF NOT EXISTS terms_pk ON {s}.terms (pk)")
+            # Field lengths for BM25, as Lucene's one-byte norms.
+            cur.execute(
+                f"CREATE TABLE IF NOT EXISTS {s}.norms ("
+                f"pk bigint NOT NULL REFERENCES {s}.docs ON DELETE CASCADE, "
+                "field text NOT NULL, norm smallint, total int NOT NULL, "
+                "PRIMARY KEY (pk, field))"
             )
         conn.commit()
 
@@ -229,7 +250,7 @@ class ParadeDBConnection(Connection):
             elif isinstance(exc, Unsupported):
                 status = 400
                 data = self._error(
-                    Error(400, "illegal_argument_exception", f"ParadeDB: {exc}")
+                    Error(400, "illegal_argument_exception", f"unsupported: {exc}")
                 )
             elif isinstance(exc, (ParseError, ValueError, KeyError, TypeError)):
                 status = 400
@@ -278,7 +299,7 @@ class ParadeDBConnection(Connection):
             return self._scroll(method, data, params)
         if head in ("_search", "_count"):
             parts = ["*"] + parts
-        if head in ("_refresh", "_flush"):
+        if head in ("_refresh", "_flush", "_forcemerge"):
             return 200, {"_shards": {"total": 1, "successful": 1, "failed": 0}}
         if head.startswith("_") and parts[0] != "*":
             raise Unsupported(f"endpoint [/{'/'.join(parts)}]")
@@ -300,7 +321,7 @@ class ParadeDBConnection(Connection):
             return 200, self._search(cur, name, data, params)
         if action == "_bulk":
             return self._bulk(cur, name, body, params)
-        if action in ("_refresh", "_flush"):
+        if action in ("_refresh", "_flush", "_forcemerge"):
             self._resolve(cur, name, params)
             return 200, {"_shards": {"total": 1, "successful": 1, "failed": 0}}
         if action in ("_alias", "_aliases"):
@@ -319,13 +340,13 @@ class ParadeDBConnection(Connection):
         from opensearchpy import VERSION
 
         return {
-            "name": "paradedb",
-            "cluster_name": "paradedb",
+            "name": "postgres",
+            "cluster_name": "postgres",
             "version": {
                 "distribution": "opensearch",
                 "number": ".".join(map(str, VERSION)),
             },
-            "tagline": "Invenio on ParadeDB",
+            "tagline": "Invenio search on Postgres",
         }
 
     # Index metadata
@@ -598,7 +619,7 @@ class ParadeDBConnection(Connection):
     # Documents
 
     def _write_index(self, cur, name, cache):
-        """Resolve the concrete index a write to ``name`` goes to."""
+        """Resolve the index a write to ``name`` goes to: ``{index, schema}``."""
         if name in cache:
             return cache[name]
         names, aliases = self._names(cur)
@@ -616,36 +637,76 @@ class ParadeDBConnection(Connection):
             self._create(cur, name, {})
             index = name
         mappings, settings = self._meta(cur, [index])[index]
-        cache[name] = (index, self._text_spec(mappings, settings))
+        cache[name] = {"index": index, "schema": Schema(mappings, settings)}
         return cache[name]
 
-    @staticmethod
-    def _text_spec(mappings, settings):
-        """Document paths whose values go into the catch-all text column."""
-        default = settings.get("query.default_field")
-        if not default or default == "*" or default == ["*"]:
-            return None
-        if isinstance(default, str):
-            default = [default]
-        fields = Fields([mappings])
-        return {fields.resolve(f)[0] for f in default}
+    def _store(self, cur, entry, doc_id, doc, version):
+        """Write a document and its postings. Returns its pk."""
+        schema = entry["schema"]
+        try:
+            new = schema.dynamic(doc)
+        except DynamicError as exc:
+            raise Error(400, "strict_dynamic_mapping_exception", str(exc))
+        if new:
+            mappings = _merge(schema.mappings, {"properties": new})
+            cur.execute(
+                f"UPDATE {self.schema}.indices SET mappings = %s WHERE name = %s",
+                [json.dumps(mappings), entry["index"]],
+            )
+            entry["schema"] = schema = Schema(mappings, schema.settings)
+        cur.execute(
+            f"INSERT INTO {self.docs} (idx, id, version, shard, doc) "
+            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idx, id) DO UPDATE SET "
+            "version = EXCLUDED.version, doc = EXCLUDED.doc, "
+            f"seq = nextval('{self.schema}.docs_seq') RETURNING pk",
+            [
+                entry["index"],
+                doc_id,
+                version,
+                shard_of(doc_id, schema.shards),
+                json.dumps(doc),
+            ],
+        )
+        pk = cur.fetchone()[0]
+        for table in ("terms", "norms"):
+            cur.execute(f"DELETE FROM {self.schema}.{table} WHERE pk = %s", [pk])
+        postings, norms = schema.terms(schema.with_copies(doc))
+        if postings:
+            cur.execute(
+                f"INSERT INTO {self.schema}.terms "
+                "SELECT %s, f, t, n, p FROM jsonb_to_recordset(%s::jsonb) "
+                "AS x(f text, t text, n int, p jsonb)",
+                [
+                    pk,
+                    json.dumps(
+                        [{"f": f, "t": t, "n": n, "p": p} for f, t, n, p in postings]
+                    ),
+                ],
+            )
+        if norms:
+            cur.execute(
+                f"INSERT INTO {self.schema}.norms "
+                "SELECT %s, f, n, t FROM jsonb_to_recordset(%s::jsonb) "
+                "AS x(f text, n smallint, t int)",
+                [
+                    pk,
+                    json.dumps(
+                        [
+                            {
+                                "f": f,
+                                "n": None if length is None else encode_norm(length),
+                                "t": total,
+                            }
+                            for f, length, total in norms
+                        ]
+                    ),
+                ],
+            )
+        return pk
 
-    @staticmethod
-    def _text(doc, spec):
-        values = []
-        for path, value in leaves(doc):
-            if isinstance(value, bool) or value is None:
-                continue
-            if (
-                spec is None
-                or path in spec
-                or any(fnmatch.fnmatchcase(path, p) for p in spec if "*" in p)
-            ):
-                values.append(str(value))
-        return "\n".join(values)
-
-    def _put(self, cur, index, spec, doc_id, doc, version, version_type, op):
+    def _put(self, cur, entry, doc_id, doc, version, version_type, op):
         """Store a document. Returns ``(status, result, version)``."""
+        index = entry["index"]
         cur.execute(
             f"SELECT version FROM {self.docs} WHERE idx = %s AND id = %s FOR UPDATE",
             [index, doc_id],
@@ -671,13 +732,7 @@ class ParadeDBConnection(Connection):
                 )
         else:
             version = (current or 0) + 1
-        cur.execute(
-            f"INSERT INTO {self.docs} (idx, id, version, text, doc) "
-            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idx, id) DO UPDATE SET "
-            "version = EXCLUDED.version, text = EXCLUDED.text, doc = EXCLUDED.doc, "
-            f"seq = nextval('{self.schema}.docs_seq')",
-            [index, doc_id, version, self._text(doc, spec), json.dumps(doc)],
-        )
+        self._store(cur, entry, doc_id, doc, version)
         if current is None:
             return 201, "created", version
         return 200, "updated", version
@@ -751,12 +806,11 @@ class ParadeDBConnection(Connection):
                 cur, index[0], doc_id, version, version_type
             )
             return status, self._doc_result(index[0], doc_id, status, result, v)
-        index, spec = self._write_index(cur, name, {})
+        entry = self._write_index(cur, name, {})
+        index = entry["index"]
         if action == "_update":
             doc = self._updated(cur, index, doc_id, data)
-            status, result, v = self._put(
-                cur, index, spec, doc_id, doc, None, None, "index"
-            )
+            status, result, v = self._put(cur, entry, doc_id, doc, None, None, "index")
         else:
             op = (
                 "create"
@@ -764,7 +818,7 @@ class ParadeDBConnection(Connection):
                 else "index"
             )
             status, result, v = self._put(
-                cur, index, spec, doc_id, data, version, version_type, op
+                cur, entry, doc_id, data, version, version_type, op
             )
         return status, self._doc_result(index, doc_id, status, result, v)
 
@@ -806,12 +860,13 @@ class ParadeDBConnection(Connection):
                         cur, index, doc_id, version, version_type
                     )
                 else:
-                    index, spec = self._write_index(cur, name, cache)
+                    entry = self._write_index(cur, name, cache)
+                    index = entry["index"]
                     if op == "update":
                         source = self._updated(cur, index, doc_id, source)
                         version, version_type = None, None
                     status, result, v = self._put(
-                        cur, index, spec, doc_id, source, version, version_type, op
+                        cur, entry, doc_id, source, version, version_type, op
                     )
                 item = self._doc_result(index, doc_id, status, result, v)
                 item["status"] = status
@@ -856,143 +911,179 @@ class ParadeDBConnection(Connection):
             self._resolve(cur, expr, params)
         names = self._resolve(cur, expr, {"ignore_unavailable": "true"})
         meta = self._meta(cur, names)
-        fields = Fields([m for m, _ in meta.values()])
-        slots = {}
-        tr = Translator(
-            fields,
-            self.docs,
-            percolate=lambda field, docs: self._percolate(
-                cur, names, meta, field, docs, slots
-            ),
-        )
-        cond = tr.where(body.get("query"))
-        where_sql = f"d.idx = ANY(%s::text[]) AND COALESCE({cond[0]}, FALSE)"
-        where_params = [names] + cond[1]
+        slots, searchers = {}, {}
+        for name in names:
+            mappings, settings = meta[name]
+            searcher = Searcher(
+                cur,
+                self.schema,
+                name,
+                Schema(mappings, settings),
+                Translator(Fields([mappings])),
+            )
+            searcher.percolate = functools.partial(
+                self._percolate, cur, name, meta[name], slots=slots
+            )
+            searchers[name] = searcher
 
-        cur.execute(
-            f"SELECT count(*) FROM {self.docs} d WHERE {where_sql}", where_params
-        )
-        total = cur.fetchone()[0]
+        # Each index is scored on its own, like OpenSearch scores each shard.
+        def match(query, scoring=True):
+            out = {}
+            for searcher in searchers.values():
+                out.update(searcher.run(query, 1.0, scoring))
+            return out
+
+        scores = match(body.get("query"))
         shards = {"total": 1, "successful": 1, "skipped": 0, "failed": 0}
         if count:
-            return {"count": total, "_shards": shards}
+            return {"count": len(scores), "_shards": shards}
 
         aggs_spec = body.get("aggs") or body.get("aggregations")
         aggregations = None
         if aggs_spec:
-            aggs = Aggregations(tr, aggs_spec)
+            aggs = Aggregations(
+                Fields([m for m, _ in meta.values()]),
+                aggs_spec,
+                lambda query: set(match(query, False)),
+            )
             select, select_params, keys = aggs.select()
             cur.execute(
-                f"SELECT {select} FROM {self.docs} d WHERE {where_sql}",
-                select_params + where_params,
+                f"SELECT {select} FROM {self.docs} d WHERE d.pk = ANY(%s::bigint[])",
+                select_params + [list(scores)],
             )
             rows = [dict(zip(keys, row)) for row in cur.fetchall()]
             aggregations = aggs.compute(rows)
 
         if body.get("post_filter"):
-            post = tr.where(body["post_filter"], scoring=False)
-            where_sql += f" AND COALESCE({post[0]}, FALSE)"
-            where_params += post[1]
-            cur.execute(
-                f"SELECT count(*) FROM {self.docs} d WHERE {where_sql}", where_params
+            keep = match(body["post_filter"], False)
+            scores = {pk: v for pk, v in scores.items() if pk in keep}
+
+        specs = _sort_specs(body.get("sort"))
+        with_score = any(s[0] == "_score" for s in specs) or _true(
+            body.get("track_scores")
+        )
+        need_doc = any(s[0] not in ("_score", "_doc", "_id") for s in specs)
+        cur.execute(
+            f"SELECT d.pk, d.idx, d.id, d.seq, d.shard"
+            f"{', d.doc' if need_doc else ''} FROM {self.docs} d "
+            "WHERE d.pk = ANY(%s::bigint[])",
+            [list(scores)],
+        )
+        entries = []
+        for row in cur.fetchall():
+            pk, idx, doc_id, seq, shard = row[:5]
+            schema = searchers[idx].schema
+            values = [
+                _sort_value(schema, spec, row[5] if need_doc else None, scores[pk], row)
+                for spec in specs
+            ]
+            entries.append((values, (idx, shard, seq), pk, idx, doc_id))
+        entries.sort(
+            key=functools.cmp_to_key(
+                lambda a, b: (
+                    _compare(a[0], b[0], specs) or (a[1] > b[1]) - (a[1] < b[1])
+                )
             )
-            total = cur.fetchone()[0]
+        )
+        if body.get("search_after") is not None:
+            after = body["search_after"]
+            entries = [e for e in entries if _compare(e[0], after, specs) > 0]
+        total = len(scores)
 
         size = int(body.get("size", params.get("size", 10)))
         frm = int(body.get("from", params.get("from", 0)))
-        order_sql, order_params, by_score = tr.order_by(body.get("sort"))
-        with_score = by_score or _true(body.get("track_scores"))
-        ctes, joins, score_params = [], [], []
-        if with_score and tr.scoring:
-            for n, (expr_sql, p) in enumerate(tr.scoring):
-                ctes.append(
-                    f"s{n} AS (SELECT pk, paradedb.score(pk) AS sc FROM {self.docs} "
-                    f"WHERE pk @@@ {expr_sql})"
-                )
-                joins.append(f"LEFT JOIN s{n} ON s{n}.pk = d.pk")
-                score_params += p
-            score = " + ".join(f"COALESCE(s{n}.sc, 0)" for n in range(len(ctes)))
-        else:
-            score = "1.0" if with_score else "NULL::real"
-        sql = (
-            ("WITH " + ", ".join(ctes) + " " if ctes else "")
-            + f"SELECT d.pk, d.idx, d.id, d.version, d.doc, ({score})::float AS score "
-            f"FROM {self.docs} d {' '.join(joins)} WHERE {where_sql} "
-            f"ORDER BY {order_sql}"
+        page = entries[frm : frm + size] if limit else entries
+        cur.execute(
+            f"SELECT pk, version, doc FROM {self.docs} WHERE pk = ANY(%s::bigint[])",
+            [[e[2] for e in page]],
         )
-        sql_params = score_params + where_params + order_params
-        if limit:
-            sql += " LIMIT %s OFFSET %s"
-            sql_params += [size, frm]
-        cur.execute(sql, sql_params)
+        stored = {pk: (v, doc) for pk, v, doc in cur.fetchall()}
         version = _true(params.get("version")) or body.get("version") is True
         source = self._source_param(params, body)
         hits = []
-        for pk, idx, doc_id, v, doc, sc in cur.fetchall():
-            hit = {"_index": idx, "_id": doc_id, "_score": sc}
+        for values, _, pk, idx, doc_id in page:
+            hit = {
+                "_index": idx,
+                "_id": doc_id,
+                "_score": _java_float(scores[pk]) if with_score else None,
+            }
             if version:
-                hit["_version"] = v
-            src = filter_source(doc, source)
+                hit["_version"] = stored[pk][0]
+            src = filter_source(stored[pk][1], source)
             if src is not None:
                 hit["_source"] = src
             if pk in slots:
                 hit["fields"] = {"_percolator_document_slot": slots[pk]}
+            if any(spec[0] != "_score" for spec in specs):
+                hit["sort"] = [
+                    _java_float(v) if spec[0] == "_score" else v
+                    for v, spec in zip(values, specs)
+                ]
             hits.append(hit)
-        scores = [h["_score"] for h in hits if h["_score"] is not None]
+        scored = [scores[pk] for pk in scores] if with_score else []
+        track = body.get("track_total_hits", 10000)
+        relation = "eq"
+        if track is False or track in ("false",):
+            total_hits = None
+        else:
+            limit_total = None if track is True or track == "true" else int(track)
+            if limit_total is not None and total > limit_total:
+                total, relation = limit_total, "gte"
+            total_hits = {"value": total, "relation": relation}
         result = {
             "took": 0,
             "timed_out": False,
             "_shards": shards,
             "hits": {
-                "total": {"value": total, "relation": "eq"},
-                "max_score": max(scores) if scores else None,
+                "max_score": _java_float(max(scored)) if scored else None,
                 "hits": hits,
             },
         }
+        if total_hits is not None:
+            result["hits"] = {"total": total_hits, **result["hits"]}
         if aggregations is not None:
             result["aggregations"] = aggregations
         return result
 
-    def _percolate(self, cur, names, meta, field, documents, slots):
-        """Run stored queries against ``documents``; returns matching query rows."""
+    def _percolate(self, cur, name, meta, field, documents, slots):
+        """Run the queries stored in ``name`` against ``documents``.
+
+        Returns the pks of the matching query documents and records the
+        matching document positions in ``slots``.
+        """
+        schema = Schema(*meta)
+        spec = schema.field(field)
+        if spec is None or spec.type != "percolator":
+            return []
         matched = []
         cur.execute("SAVEPOINT percolate")
         try:
-            for name in names:
-                mappings, settings = meta[name]
-                fields = Fields([mappings])
-                if fields.resolve(field)[1] != "percolator":
-                    continue
-                spec = self._text_spec(mappings, settings)
-                temp = []
-                for slot, doc in enumerate(documents):
-                    cur.execute(
-                        f"INSERT INTO {self.docs} (idx, id, version, text, doc) "
-                        "VALUES (%s, %s, 1, %s, %s) RETURNING pk",
-                        [
-                            name,
-                            f"_percolate-{slot}",
-                            self._text(doc, spec),
-                            json.dumps(doc),
-                        ],
-                    )
-                    temp.append(cur.fetchone()[0])
-                cur.execute(
-                    f"SELECT pk, doc -> %s FROM {self.docs} "
-                    "WHERE idx = %s AND doc ? %s AND NOT (pk = ANY(%s::bigint[]))",
-                    [field, name, field, temp],
+            entry = {"index": name, "schema": schema}
+            temp = [
+                self._store(cur, entry, f"_percolate-{slot}", doc, 1)
+                for slot, doc in enumerate(documents)
+            ]
+            cur.execute(
+                f"SELECT pk, doc -> %s FROM {self.docs} "
+                "WHERE idx = %s AND doc ? %s AND NOT (pk = ANY(%s::bigint[]))",
+                [field, name, field, temp],
+            )
+            stored = cur.fetchall()
+            searcher = Searcher(
+                cur,
+                self.schema,
+                name,
+                entry["schema"],
+                Translator(Fields([entry["schema"].mappings])),
+                restrict=temp,
+            )
+            for pk, query in stored:
+                hit_slots = sorted(
+                    temp.index(p) for p in searcher.run(query, 1.0, False)
                 )
-                for pk, stored in cur.fetchall():
-                    cond = Translator(fields, self.docs).where(stored)
-                    cur.execute(
-                        f"SELECT d.pk FROM {self.docs} d "
-                        f"WHERE d.pk = ANY(%s::bigint[]) AND COALESCE({cond[0]}, FALSE)",
-                        [temp] + cond[1],
-                    )
-                    hit_slots = sorted(temp.index(r[0]) for r in cur.fetchall())
-                    if hit_slots:
-                        matched.append(pk)
-                        slots[pk] = hit_slots
+                if hit_slots:
+                    matched.append(pk)
+                    slots[pk] = hit_slots
         finally:
             cur.execute("ROLLBACK TO SAVEPOINT percolate")
         return matched
@@ -1034,3 +1125,95 @@ class ParadeDBConnection(Connection):
             )
         n = len(result["hits"]["hits"])
         return {"took": 0, "timed_out": False, "total": n, "deleted": n, "failures": []}
+
+
+# Sorting
+# =======
+
+
+def _sort_specs(sort):
+    """``[(field, descending, missing, mode)]``; by default by score."""
+    if not sort:
+        return [("_score", True, "_last", None)]
+    out = []
+    for item in _listify(sort):
+        if isinstance(item, str):
+            field, opts = item, {}
+        else:
+            ((field, opts),) = item.items()
+        if isinstance(opts, str):
+            opts = {"order": opts}
+        order = str(opts.get("order") or ("desc" if field == "_score" else "asc"))
+        if order.lower() not in ("asc", "desc"):
+            raise Unsupported(f"sort order [{order}]")
+        out.append(
+            (
+                field,
+                order.lower() == "desc",
+                opts.get("missing", "_last"),
+                opts.get("mode"),
+            )
+        )
+    return out
+
+
+def _sort_value(schema, spec, doc, score, row):
+    """The value OpenSearch sorts a hit by, as it reports it in ``sort``."""
+    field, desc, missing, mode = spec
+    if field == "_score":
+        return score
+    if field == "_doc":
+        return row[3]
+    if field == "_id":
+        return row[2]
+    f = schema.field(field)
+    kind = f.type if f else None
+    values = []
+    for value in values_at(doc, f.source if f else field):
+        if value is None or isinstance(value, (dict, list)):
+            continue
+        if kind in KEYWORD_LIKE:
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            value = schema.tokens(f, str(value))[0][0]
+        elif kind in DATES:
+            d = parse_date(value)
+            value = int((d - EPOCH).total_seconds() * 1000) if d else None
+        elif isinstance(value, bool):
+            value = int(value)
+        elif kind in NUMERIC and isinstance(value, str):
+            value = float(value) if "." in value else int(value)
+        if value is not None:
+            values.append(value)
+    if values:
+        if mode == "sum":
+            return sum(values)
+        if mode == "avg":
+            return sum(values) / len(values)
+        if mode == "max" or (mode is None and desc):
+            return max(values)
+        return min(values)
+    if kind in KEYWORD_LIKE or f is None:
+        return None
+    return LONG_MAX if desc == (missing == "_first") else LONG_MIN
+
+
+def _compare(a, b, specs):
+    for x, y, (_, desc, missing, _) in zip(a, b, specs):
+        if x == y:
+            continue
+        if x is None or y is None:
+            res = 1 if x is None else -1
+            return -res if missing == "_first" else res
+        res = -1 if x < y else 1
+        return -res if desc else res
+    return 0
+
+
+def _java_float(value):
+    """A 32-bit float score as OpenSearch prints it: the shortest exact digits."""
+    for digits in range(1, 10):
+        short = float(f"{value:.{digits}g}")
+        if f32(short) == value:
+            return short
+    return value

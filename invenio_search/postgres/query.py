@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: 2026 CERN.
 # SPDX-License-Identifier: MIT
 
-"""Translate OpenSearch query DSL and aggregations to SQL over ParadeDB.
+"""SQL conditions for filter clauses, and aggregations over matching documents.
 
-Text clauses (``match``, ``query_string``, ``multi_match``, ...) become ParadeDB
-BM25 queries. Filters (``term``, ``terms``, ``range``, ``exists``, ``nested``,
-...) become exact SQL/JSON path conditions, so permission filters match exactly
-as they do in OpenSearch. Any clause or aggregation not handled here raises
-:class:`Unsupported` instead of being ignored.
+:class:`Translator` turns filter clauses (``term`` on numbers and dates,
+``range``, ``exists``, ``ids``, ``nested``, ...) into exact SQL/JSON path
+conditions on the stored documents. :class:`Aggregations` computes OpenSearch
+aggregations from the field values of the matched documents. Anything not
+handled raises :class:`Unsupported` instead of being ignored.
 
 SQL fragments are ``(sql, params)`` tuples with psycopg2 ``%s`` placeholders;
-the searched table is aliased ``d``.
+the documents table is aliased ``d``.
 """
 
 import calendar
@@ -19,7 +19,7 @@ import json
 import re
 from fnmatch import fnmatchcase
 
-from . import querystring
+from .lucene import murmur3_32
 
 TEXT_TYPES = {"text", "search_as_you_type", "match_only_text", "completion"}
 NUMERIC_TYPES = {
@@ -42,7 +42,7 @@ EPOCH = dt.datetime(1970, 1, 1)
 
 
 class Unsupported(Exception):
-    """The request uses a feature the ParadeDB backend does not implement."""
+    """The request uses a feature the Postgres backend does not implement."""
 
 
 def jsonpath(path):
@@ -174,8 +174,17 @@ def parse_date(value):
         return None
     if isinstance(value, (int, float)):
         return EPOCH + dt.timedelta(milliseconds=value)
+    text = str(value).strip()
     try:
-        return dt.datetime.fromisoformat(_pad(str(value)))
+        d = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if d.tzinfo is not None:
+            d = d.astimezone(dt.timezone.utc).replace(tzinfo=None)
+        # OpenSearch keeps dates as whole milliseconds.
+        return d.replace(microsecond=d.microsecond // 1000 * 1000)
+    except ValueError:
+        pass
+    try:
+        return dt.datetime.fromisoformat(_pad(text))
     except ValueError:
         return None
 
@@ -278,22 +287,13 @@ class Fields:
 
 
 class Translator:
-    """Translate one search request's queries into SQL conditions."""
+    """Translate filter clauses into SQL conditions on the documents table."""
 
-    def __init__(self, fields, table, percolate=None):
-        """Constructor.
-
-        :param fields: :class:`Fields` of the searched indices.
-        :param table: name of the documents table.
-        :param percolate: callable ``(field, documents) -> [pk]`` that runs
-            stored percolator queries, or ``None`` when not supported.
-        """
+    def __init__(self, fields):
+        """Constructor, from the :class:`Fields` of the searched index."""
         self.fields = fields
-        self.table = table
-        self.percolate = percolate
-        self.scoring = []
 
-    def where(self, query, ctx=ROOT, scoring=True):
+    def where(self, query, ctx=ROOT):
         """Translate a query clause into an SQL condition."""
         if not query:
             return TRUE
@@ -303,7 +303,7 @@ class Translator:
         method = getattr(self, "_q_" + kind, None)
         if method is None:
             raise Unsupported(f"query [{kind}]")
-        return method(body, ctx, scoring)
+        return method(body, ctx)
 
     @staticmethod
     def _rel(ctx, path):
@@ -319,29 +319,14 @@ class Translator:
             raise Unsupported(f"[{name}] needs exactly one field")
         return items[0]
 
-    def _bm25(self, expr, params, ctx, scoring):
-        if ctx[2]:
-            raise Unsupported("full-text query inside a nested query")
-        if scoring:
-            self.scoring.append((expr, params))
-        return (f"d.pk IN (SELECT pk FROM {self.table} WHERE pk @@@ {expr})", params)
-
     def _exact(self, ctx, path, kind, values):
         if path in ("_id", "_index"):
             if ctx[2]:
                 raise Unsupported(f"[{path}] inside a nested query")
             column = "d.id" if path == "_id" else "d.idx"
             return (f"{column} = ANY(%s::text[])", [[str(v) for v in values]])
-        if kind in TEXT_TYPES and not ctx[2]:
-            return _join(
-                (
-                    self._bm25(
-                        "paradedb.term(%s, %s)", ["doc." + path, str(v)], ctx, False
-                    )
-                    for v in values
-                ),
-                "OR",
-            )
+        if kind in TEXT_TYPES:
+            return self._words(ctx, path, [str(v).lower() for v in values], False)
         variants, seen = [], set()
         for value in values:
             for v in _variants(value):
@@ -374,68 +359,23 @@ class Translator:
         parts = [self._like(ctx, path, f"\\y{_escape_re(w)}\\y", True) for w in words]
         return _join(parts, "AND" if conjunction else "OR")
 
-    def _text_match(self, ctx, column, path, text, conjunction, scoring):
-        """Analysed match on the catch-all column (``path=None``) or a field."""
-        if not ctx[2]:
-            return self._bm25(
-                "paradedb.match(%s, %s, conjunction_mode => %s)",
-                [column, str(text), conjunction],
-                ctx,
-                scoring,
-            )
-        return self._words(ctx, path, _tokens(text), conjunction)
-
-    def _prefix(self, ctx, column, path, kind, prefix, scoring):
-        if kind in TEXT_TYPES or path is None:
-            if not ctx[2]:
-                return self._bm25(
-                    "paradedb.phrase_prefix(%s, %s)",
-                    [column, [prefix.lower()]],
-                    ctx,
-                    scoring,
-                )
-            return self._like(ctx, path, f"\\y{_escape_re(prefix)}", True)
-        return self._like(ctx, path, "^" + _escape_re(prefix), False)
-
-    def _phrase(self, ctx, column, path, text, scoring):
-        if not ctx[2]:
-            words = " ".join(_tokens(text))
-            return self._bm25(
-                "paradedb.parse(%s, lenient => true)",
-                [f'{column}:"{words}"'],
-                ctx,
-                scoring,
-            )
-        return self._like(
-            ctx, path, "\\y" + "\\W+".join(map(_escape_re, _tokens(text))) + "\\y", True
-        )
-
-    def _target(self, field):
-        """Return ``(paradedb column, document path, type)`` for a text target."""
-        if field in (None, "*", "_all"):
-            return "text", None, "text"
-        path, kind = self.fields.resolve(field)
-        return "doc." + path, path, kind
-
     # Leaf and compound clauses
 
-    def _q_match_all(self, body, ctx, scoring):
+    def _q_match_all(self, body, ctx):
         return TRUE
 
-    def _q_match_none(self, body, ctx, scoring):
+    def _q_match_none(self, body, ctx):
         return FALSE
 
-    def _q_bool(self, body, ctx, scoring):
+    def _q_bool(self, body, ctx):
         must = _listify(body.get("must"))
         filters = _listify(body.get("filter"))
         should = _listify(body.get("should"))
-        parts = [self.where(q, ctx, scoring) for q in must]
-        parts += [self.where(q, ctx, False) for q in filters]
-        parts += [
-            _not(self.where(q, ctx, False)) for q in _listify(body.get("must_not"))
-        ]
+        parts = [self.where(q, ctx) for q in must]
+        parts += [self.where(q, ctx) for q in filters]
+        parts += [_not(self.where(q, ctx)) for q in _listify(body.get("must_not"))]
         if should:
-            clauses = [self.where(q, ctx, scoring) for q in should]
+            clauses = [self.where(q, ctx) for q in should]
             default = 0 if (must or filters) else 1
             n = _msm(body.get("minimum_should_match"), len(clauses), default)
             if n > len(clauses):
@@ -453,37 +393,37 @@ class Translator:
                 )
         return _join(parts, "AND")
 
-    def _q_constant_score(self, body, ctx, scoring):
-        return self.where(body.get("filter"), ctx, False)
+    def _q_constant_score(self, body, ctx):
+        return self.where(body.get("filter"), ctx)
 
-    def _q_dis_max(self, body, ctx, scoring):
-        return _join((self.where(q, ctx, scoring) for q in body["queries"]), "OR")
+    def _q_dis_max(self, body, ctx):
+        return _join((self.where(q, ctx) for q in body["queries"]), "OR")
 
-    def _q_term(self, body, ctx, scoring):
+    def _q_term(self, body, ctx):
         field, value = self._single(body, "term")
         if isinstance(value, dict):
             value = value["value"]
         path, kind = self.fields.resolve(field)
         return self._exact(ctx, path, kind, [value])
 
-    def _q_terms(self, body, ctx, scoring):
+    def _q_terms(self, body, ctx):
         field, values = self._single(body, "terms")
         if not isinstance(values, list):
             raise Unsupported("[terms] lookup")
         path, kind = self.fields.resolve(field)
         return self._exact(ctx, path, kind, values)
 
-    def _q_ids(self, body, ctx, scoring):
+    def _q_ids(self, body, ctx):
         return self._exact(ctx, "_id", None, _listify(body.get("values")))
 
-    def _q_exists(self, body, ctx, scoring):
+    def _q_exists(self, body, ctx):
         path, _ = self.fields.resolve(body["field"])
         return (
             f"jsonb_path_exists({ctx[0]}, %s::jsonpath)",
             [f"{jsonpath(self._rel(ctx, path))} ? (@ != null)"],
         )
 
-    def _q_range(self, body, ctx, scoring):
+    def _q_range(self, body, ctx):
         field, spec = self._single(body, "range")
         path, kind = self.fields.resolve(field)
         lower = [
@@ -560,238 +500,64 @@ class Translator:
             [each_value(self._rel(ctx, path))] + params,
         )
 
-    def _q_nested(self, body, ctx, scoring):
+    def _q_nested(self, body, ctx):
         path, _ = self.fields.resolve(body["path"])
         alias = f"e{ctx[2] + 1}"
-        inner = self.where(body["query"], (alias, path, ctx[2] + 1), False)
+        inner = self.where(body["query"], (alias, path, ctx[2] + 1))
         return (
             f"EXISTS (SELECT 1 FROM jsonb_path_query({ctx[0]}, %s::jsonpath) {alias} "
             f"WHERE {inner[0]})",
             [each_value(self._rel(ctx, path))] + inner[1],
         )
 
-    # Full-text clauses
+    # Full-text clauses inside nested queries
+    #
+    # Top-level text queries are scored by :mod:`.scoring` from the postings.
+    # Inside a ``nested`` query they match words case-insensitively in the
+    # nested object's values, without the field's analyzer.
 
-    def _q_match(self, body, ctx, scoring):
+    def _text_path(self, field):
+        path, kind = self.fields.resolve(field)
+        if kind is not None and kind not in TEXT_TYPES:
+            return path, kind
+        return path, None
+
+    def _q_match(self, body, ctx):
         field, opts = self._single(body, "match")
         opts = opts if isinstance(opts, dict) else {"query": opts}
-        column, path, kind = self._target(field)
-        if path is not None and kind not in TEXT_TYPES and kind is not None:
+        path, kind = self._text_path(field)
+        if kind is not None:
             return self._exact(ctx, path, kind, [opts["query"]])
         conjunction = str(opts.get("operator", "or")).lower() == "and"
-        return self._text_match(ctx, column, path, opts["query"], conjunction, scoring)
+        return self._words(ctx, path, _tokens(opts["query"]), conjunction)
 
-    def _q_match_phrase(self, body, ctx, scoring):
+    def _q_match_phrase(self, body, ctx):
         field, opts = self._single(body, "match_phrase")
         opts = opts if isinstance(opts, dict) else {"query": opts}
-        column, path, kind = self._target(field)
-        if path is not None and kind not in TEXT_TYPES and kind is not None:
+        path, kind = self._text_path(field)
+        if kind is not None:
             return self._exact(ctx, path, kind, [opts["query"]])
-        return self._phrase(ctx, column, path, opts["query"], scoring)
+        words = "\\W+".join(map(_escape_re, _tokens(opts["query"])))
+        return self._like(ctx, path, f"\\y{words}\\y", True)
 
-    def _q_match_phrase_prefix(self, body, ctx, scoring):
-        field, opts = self._single(body, "match_phrase_prefix")
-        opts = opts if isinstance(opts, dict) else {"query": opts}
-        column, path, kind = self._target(field)
-        words = _tokens(opts["query"])
-        if not ctx[2] and words:
-            return self._bm25(
-                "paradedb.phrase_prefix(%s, %s)", [column, words], ctx, scoring
-            )
-        return self._prefix(ctx, column, path, kind, " ".join(words), scoring)
-
-    def _q_prefix(self, body, ctx, scoring):
+    def _q_prefix(self, body, ctx):
         field, value = self._single(body, "prefix")
         if isinstance(value, dict):
             value = value["value"]
-        column, path, kind = self._target(field)
-        return self._prefix(ctx, column, path, kind, str(value), scoring)
+        path, kind = self._text_path(field)
+        if kind is None:
+            return self._like(ctx, path, f"\\y{_escape_re(str(value))}", True)
+        return self._like(ctx, path, "^" + _escape_re(str(value)), False)
 
-    def _q_wildcard(self, body, ctx, scoring):
+    def _q_wildcard(self, body, ctx):
         field, value = self._single(body, "wildcard")
         if isinstance(value, dict):
             value = value.get("value", value.get("wildcard"))
         value = str(value).replace("*", "\0").replace("?", "\1")
-        return self._qs_term(field, value, True, ctx, None, scoring)
-
-    def _q_multi_match(self, body, ctx, scoring):
-        fields = body.get("fields") or [None]
-        query = body["query"]
-        kind = body.get("type", "best_fields")
-        conjunction = str(body.get("operator", "or")).lower() == "and"
-        targets = [self._target(f) for f in fields]
-        if kind in ("phrase", "phrase_prefix"):
-            parts = []
-            for column, path, _ in targets:
-                if kind == "phrase":
-                    parts.append(self._phrase(ctx, column, path, query, scoring))
-                elif not ctx[2]:
-                    parts.append(
-                        self._bm25(
-                            "paradedb.phrase_prefix(%s, %s)",
-                            [column, _tokens(query)],
-                            ctx,
-                            scoring,
-                        )
-                    )
-            return _join(parts, "OR")
-        if kind == "bool_prefix":
-            words = _tokens(query)
-            if not words:
-                return FALSE
-            per_word = []
-            for i, word in enumerate(words):
-                last = i == len(words) - 1
-                alternatives = []
-                for column, path, ftype in targets:
-                    if last:
-                        alternatives.append(
-                            self._prefix(
-                                ctx, column, path, ftype or "text", word, scoring
-                            )
-                        )
-                    else:
-                        alternatives.append(
-                            self._text_match(ctx, column, path, word, False, scoring)
-                        )
-                per_word.append(_join(alternatives, "OR"))
-            return _join(per_word, "AND" if conjunction else "OR")
-        parts = []
-        for column, path, ftype in targets:
-            if path is not None and ftype not in TEXT_TYPES and ftype is not None:
-                parts.append(self._exact(ctx, path, ftype, [query]))
-            else:
-                parts.append(
-                    self._text_match(ctx, column, path, query, conjunction, scoring)
-                )
-        return _join(parts, "OR")
-
-    def _q_query_string(self, body, ctx, scoring):
-        fields = body.get("fields") or body.get("default_field")
-        if isinstance(fields, str):
-            fields = [fields]
-        tree = querystring.parse(body["query"], body.get("default_operator", "OR"))
-        return self._qs(tree, ctx, fields, scoring)
-
-    _q_simple_query_string = _q_query_string
-
-    def _qs(self, node, ctx, fields, scoring):
-        kind = node[0]
-        if kind == "all":
-            return TRUE
-        if kind == "bool":
-            _, must, should, must_not = node
-            parts = [self._qs(n, ctx, fields, scoring) for n in must]
-            parts += [_not(self._qs(n, ctx, fields, False)) for n in must_not]
-            if should:
-                clauses = [self._qs(n, ctx, fields, scoring) for n in should]
-                if not must:
-                    parts.append(_join(clauses, "OR"))
-            return _join(parts, "AND") if (parts or not should) else FALSE
-        if kind == "term":
-            _, field, value, wildcard = node
-            targets = [field] if field else (fields or [None])
-            return _join(
-                (
-                    self._qs_term(t, value, wildcard, ctx, fields, scoring)
-                    for t in targets
-                ),
-                "OR",
-            )
-        if kind == "phrase":
-            _, field, value = node
-            parts = []
-            for target in [field] if field else (fields or [None]):
-                column, path, ftype = self._target(target)
-                if path is not None and ftype not in TEXT_TYPES and ftype is not None:
-                    parts.append(self._exact(ctx, path, ftype, [value]))
-                else:
-                    parts.append(self._phrase(ctx, column, path, value, scoring))
-            return _join(parts, "OR")
-        if kind == "range":
-            _, field, low, high, include_low, include_high = node
-            if not field:
-                return FALSE
-            spec = {}
-            if low is not None:
-                spec["gte" if include_low else "gt"] = low
-            if high is not None:
-                spec["lte" if include_high else "lt"] = high
-            return self._q_range({field: spec}, ctx, scoring)
-        if kind == "exists":
-            return self._q_exists({"field": node[1]}, ctx, scoring)
-        raise Unsupported(f"query string node [{kind}]")
-
-    def _qs_term(self, target, value, wildcard, ctx, fields, scoring):
-        column, path, kind = self._target(target)
-        text_like = path is None or kind in TEXT_TYPES or kind is None
-        if wildcard:
-            prefix_only = (
-                value.endswith("\0") and "\0" not in value[:-1] and "\1" not in value
-            )
-            if text_like:
-                if prefix_only and value[:-1]:
-                    return self._prefix(ctx, column, path, "text", value[:-1], scoring)
-                if not ctx[2] and path is None:
-                    return self._bm25(
-                        "paradedb.regex(%s, %s)",
-                        [column, _wild(value).lower()],
-                        ctx,
-                        scoring,
-                    )
-                return self._like(ctx, path, f"\\y{_wild(value)}\\y", True)
-            return self._like(ctx, path, f"^{_wild(value)}$", False)
-        if text_like:
-            return self._text_match(ctx, column, path, value, False, scoring)
-        return self._exact(ctx, path, kind, [value])
-
-    def _q_percolate(self, body, ctx, scoring):
-        if self.percolate is None or ctx[2]:
-            raise Unsupported("[percolate] in this context")
-        documents = body.get("documents")
-        if documents is None and "document" in body:
-            documents = [body["document"]]
-        if documents is None:
-            raise Unsupported("[percolate] of indexed documents")
-        pks = self.percolate(body.get("field", "query"), documents)
-        return ("d.pk = ANY(%s::bigint[])", [pks])
-
-    # Sorting
-
-    def order_by(self, sort):
-        """Translate ``sort`` into ``(ORDER BY sql, params, sorted by score)``."""
-        if not sort:
-            return "score DESC, d.seq", [], True
-        out, params, by_score = [], [], False
-        for item in _listify(sort):
-            if isinstance(item, str):
-                field, opts = item, {}
-            else:
-                ((field, opts),) = item.items()
-            if isinstance(opts, str):
-                opts = {"order": opts}
-            order = str(opts.get("order") or ("desc" if field == "_score" else "asc"))
-            if order.lower() not in ("asc", "desc"):
-                raise Unsupported(f"sort order [{order}]")
-            if field == "_score":
-                out.append(f"score {order}")
-                by_score = True
-                continue
-            if field == "_doc":
-                out.append(f"d.seq {order}")
-                continue
-            if field == "_id":
-                out.append(f"d.id {order}")
-                continue
-            path, _ = self.fields.resolve(field)
-            nulls = "FIRST" if opts.get("missing") == "_first" else "LAST"
-            out.append(
-                f"(SELECT v FROM jsonb_path_query(d.doc, %s::jsonpath) v "
-                f"ORDER BY v {order} LIMIT 1) {order} NULLS {nulls}"
-            )
-            params.append(each_value(path))
-        out.append("d.seq")
-        return ", ".join(out), params, by_score
+        path, kind = self._text_path(field)
+        if kind is None:
+            return self._like(ctx, path, f"\\y{_wild(value)}\\y", True)
+        return self._like(ctx, path, f"^{_wild(value)}$", False)
 
 
 # Documents
@@ -892,8 +658,9 @@ def _split(agg):
 
 
 def _java_format(d, fmt):
+    millis = f"{d.microsecond // 1000:03d}"
     if not fmt:
-        return d.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        return d.strftime("%Y-%m-%dT%H:%M:%S.") + millis + "Z"
     for java, py in (
         ("yyyy", "%Y"),
         ("MM", "%m"),
@@ -901,10 +668,24 @@ def _java_format(d, fmt):
         ("HH", "%H"),
         ("mm", "%M"),
         ("ss", "%S"),
-        ("SSS", "000"),
+        ("SSS", millis),
     ):
         fmt = fmt.replace(java, py)
     return d.strftime(fmt.replace("'", ""))
+
+
+def term_partition(value, partitions):
+    """Partition of a term in a ``terms`` aggregation, as OpenSearch hashes it."""
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, int):
+        mask = (1 << 64) - 1
+        z = value & mask
+        z = ((z ^ (z >> 32)) * 0x4CD6944C5CC20B6D) & mask
+        z = ((z ^ (z >> 29)) * 0xFC12C5B19D3259E9) & mask
+        z ^= z >> 32
+        return (z - (1 << 64) if z >> 63 else z) % partitions
+    return murmur3_32(str(value).encode("utf-8"), 31) % partitions
 
 
 def _sort_key(value):
@@ -918,9 +699,13 @@ class Aggregations:
     happens in Python, which suits the small instances this backend targets.
     """
 
-    def __init__(self, translator, spec):
-        """Constructor."""
-        self.tr = translator
+    def __init__(self, fields, spec, match):
+        """Constructor.
+
+        :param match: callable returning the set of pks matching a query.
+        """
+        self.fields = fields
+        self.match = match
         self.spec = spec
         self.columns = {}
         self.filters = {}
@@ -928,7 +713,7 @@ class Aggregations:
         self._collect(spec)
 
     def _field(self, field):
-        path, _ = self.tr.fields.resolve(field)
+        path, _ = self.fields.resolve(field)
         self.columns.setdefault(
             "f:" + path,
             ("jsonb_path_query_array(d.doc, %s::jsonpath)", [each_value(path)]),
@@ -943,10 +728,10 @@ class Aggregations:
                     raise Unsupported(f"[{kind}] aggregation without a field")
                 self._field(body["field"])
             elif kind == "filter":
-                self.filters[id(body)] = self.tr.where(body, ROOT, False)
+                self.filters[id(body)] = body
             elif kind == "filters":
                 for name, query in body["filters"].items():
-                    self.filters[id(query)] = self.tr.where(query, ROOT, False)
+                    self.filters[id(query)] = query
             elif kind == "top_hits":
                 self.need_doc = True
             else:
@@ -955,7 +740,7 @@ class Aggregations:
 
     def select(self):
         """SQL select list and parameters for the aggregation rows."""
-        sql, params, keys = ["d.idx", "d.id"], [], ["_index", "_id"]
+        sql, params, keys = ["d.pk", "d.idx", "d.id"], [], ["_pk", "_index", "_id"]
         if self.need_doc:
             sql.append("d.doc")
             keys.append("_source")
@@ -963,14 +748,15 @@ class Aggregations:
             sql.append(expr)
             params += p
             keys.append(key)
-        for key, (expr, p) in self.filters.items():
-            sql.append(f"COALESCE({expr}, FALSE)")
-            params += p
-            keys.append(key)
         return ", ".join(sql), params, keys
 
     def compute(self, rows, spec=None):
         """Build the ``aggregations`` response for the given rows."""
+        if spec is None:
+            for key, query in self.filters.items():
+                pks = self.match(query)
+                for row in rows:
+                    row[key] = row["_pk"] in pks
         out = {}
         for name, agg in (self.spec if spec is None else spec).items():
             kind, body, sub = _split(agg)
@@ -981,7 +767,7 @@ class Aggregations:
         return out
 
     def _values(self, row, field):
-        return row["f:" + self.tr.fields.resolve(field)[0]] or []
+        return row["f:" + self.fields.resolve(field)[0]] or []
 
     def _terms(self, body, rows, sub):
         members = {}
@@ -996,11 +782,18 @@ class Aggregations:
                     members.setdefault(key, (value, []))[1].append(row)
         include = body.get("include")
         exclude = body.get("exclude")
+        partition = None
+        if isinstance(include, dict):
+            partition = (int(include["partition"]), int(include["num_partitions"]))
+            include = None
         items = [
             v
             for v in members.values()
             if (not isinstance(include, list) or v[0] in include)
             and (not isinstance(exclude, list) or v[0] not in exclude)
+            and (
+                partition is None or term_partition(v[0], partition[1]) == partition[0]
+            )
         ]
         if isinstance(include, str) or isinstance(exclude, str):
             raise Unsupported("[terms] include/exclude patterns")
@@ -1116,23 +909,36 @@ class Aggregations:
         return {"buckets": buckets}
 
     def _numbers(self, body, rows):
-        return [
-            v
-            for row in rows
-            for v in self._values(row, body["field"])
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-        ]
+        """Numeric values of a field; dates count as epoch milliseconds."""
+        dates = self.fields.resolve(body["field"])[1] in DATE_TYPES
+        out = []
+        for row in rows:
+            for v in self._values(row, body["field"]):
+                if dates and v is not None:
+                    d = parse_date(v)
+                    if d is not None:
+                        out.append((d - EPOCH) // dt.timedelta(milliseconds=1))
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    out.append(v)
+        return out
+
+    def _metric(self, body, value):
+        out = {"value": None if value is None else float(value)}
+        if value is not None and self.fields.resolve(body["field"])[1] in DATE_TYPES:
+            d = EPOCH + dt.timedelta(milliseconds=value)
+            out["value_as_string"] = _java_format(d, body.get("format"))
+        return out
 
     def _sum(self, body, rows, sub):
         return {"value": float(sum(self._numbers(body, rows)))}
 
     def _min(self, body, rows, sub):
         values = self._numbers(body, rows)
-        return {"value": float(min(values)) if values else None}
+        return self._metric(body, min(values) if values else None)
 
     def _max(self, body, rows, sub):
         values = self._numbers(body, rows)
-        return {"value": float(max(values)) if values else None}
+        return self._metric(body, max(values) if values else None)
 
     def _avg(self, body, rows, sub):
         values = self._numbers(body, rows)
@@ -1180,7 +986,7 @@ class Aggregations:
             if isinstance(opts, str):
                 opts = {"order": opts}
             desc = opts.get("order", "asc") == "desc"
-            path = self.tr.fields.resolve(field)[0]
+            path = self.fields.resolve(field)[0]
             present = [r for r in ordered if values_at(r["_source"], path)]
             missing = [r for r in ordered if not values_at(r["_source"], path)]
             present.sort(

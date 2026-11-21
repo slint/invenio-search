@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2026 CERN.
 # SPDX-License-Identifier: MIT
 
-"""ParadeDB search backend tests.
+"""Postgres search backend tests.
 
-The backend tests need Postgres with the ``pg_search`` extension; set
-``PARADEDB_DSN`` (e.g. ``postgresql://postgres@localhost/test``) to run them.
+The backend tests need a Postgres database; set
+``POSTGRES_DSN`` (e.g. ``postgresql://postgres@localhost/test``) to run them.
 """
 
 import os
@@ -26,7 +26,10 @@ pytestmark = pytest.mark.skipif(
         # Lucene: a prohibited clause next to an optional one leaves it optional.
         ("a -b", ("bool", [], [("term", None, "a", False)], [("term", None, "b", False)])),
         ("+a b", ("bool", [("term", None, "a", False)], [("term", None, "b", False)], [])),
-        ("title:(a b)", ("bool", [], [("term", "title", "a", False), ("term", "title", "b", False)], [])),
+        # Plain words stay together, so the field's analyzer sees them at once.
+        ("title:(a b)", ("text", "title", "a b")),
+        ("lovelac~1", ("fuzzy", None, "lovelac", "1")),
+        ("title:x^3", ("boost", ("term", "title", "x", False), 3.0)),
         ('title:"glacier melt"', ("phrase", "title", "glacier melt")),
         ("glac*", ("term", None, "glac\0", True)),
         ("year:[2000 TO 2010}", ("range", "year", "2000", "2010", True, False)),
@@ -35,24 +38,45 @@ pytestmark = pytest.mark.skipif(
     ],
 )  # fmt: skip
 def test_query_string_parse(query, tree):
-    from invenio_search.paradedb.querystring import parse
+    from invenio_search.postgres.querystring import parse
 
     assert parse(query) == tree
 
 
+def test_bm25_matches_lucene():
+    """Score from an OpenSearch ``_explain`` (freq 3, doc length 6, 2 of 30 docs)."""
+    from invenio_search.postgres.lucene import BM25, encode_norm, f32
+
+    assert BM25(1, 2, 6, 30).score(3, encode_norm(6)) == f32(0.7052188)
+
+
+def test_edge_ngram_analysis():
+    from invenio_search.postgres.analysis import Analysis
+
+    settings = {
+        "analysis.analyzer.edge.tokenizer": "standard",
+        "analysis.analyzer.edge.filter": ["lowercase", "asciifolding", "ngrams"],
+        "analysis.filter.ngrams.type": "edge_ngram",
+        "analysis.filter.ngrams.min_gram": 2,
+        "analysis.filter.ngrams.max_gram": 4,
+    }
+    terms = [t for t, _ in Analysis(settings).analyzer("edge").tokens("Zürich ETH")]
+    assert terms == ["zu", "zur", "zuri", "et", "eth"]
+
+
 @pytest.fixture()
 def client():
-    dsn = os.environ.get("PARADEDB_DSN")
+    dsn = os.environ.get("POSTGRES_DSN")
     if not dsn:
-        pytest.skip("PARADEDB_DSN not set")
+        pytest.skip("POSTGRES_DSN not set")
     import psycopg2
     from opensearchpy import OpenSearch
 
-    from invenio_search.paradedb.connection import ParadeDBConnection
+    from invenio_search.postgres.connection import PostgresConnection
 
     schema = "test_" + uuid.uuid4().hex[:8]
     yield OpenSearch(
-        hosts=["paradedb"], connection_class=ParadeDBConnection, dsn=dsn, schema=schema
+        hosts=["postgres"], connection_class=PostgresConnection, dsn=dsn, schema=schema
     )
     with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
         cur.execute(f"DROP SCHEMA {schema} CASCADE")

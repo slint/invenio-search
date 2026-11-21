@@ -28,33 +28,35 @@ Features:
 - API for providing stable searches (e.g. prevents bouncing of search results).
 - Maps JSONSchema URLs to Elasticsearch/OpenSearch indexes.
 - Supports Elasticsearch v7 and OpenSearch v1.
-- Optional Postgres search backend (ParadeDB ``pg_search``) for small
-  instances, see below.
+- Optional search backend on plain Postgres for small instances, see below.
 
-Postgres-only search (ParadeDB)
-===============================
+Postgres-only search
+====================
 
 For local development, demos and test environments, the search indices can
 live in Postgres instead of an OpenSearch cluster. The OpenSearch client is
-kept; a connection class answers its requests from Postgres with the
-`ParadeDB <https://github.com/paradedb/paradedb>`_ ``pg_search`` extension
-(AGPL). Production setups should keep using OpenSearch.
+kept; a connection class answers its requests from Postgres. It reproduces
+OpenSearch's analyzers, shard routing and BM25 scoring, so results, scores
+and ordering match OpenSearch on small data sets. It needs no extension.
+Production setups should keep using OpenSearch.
 
 .. code-block:: console
 
-    $ docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=invenio paradedb/paradedb
-    $ pip install "invenio-search[opensearch2,paradedb]"
+    $ pip install "invenio-search[opensearch2,postgres]"
 
 .. code-block:: python
 
     # invenio.cfg
     SEARCH_CLIENT_CONFIG = {
-        "connection_class": "invenio_search.paradedb.connection:ParadeDBConnection",
+        "connection_class": "invenio_search.postgres.connection:PostgresConnection",
     }
 
 Then run ``invenio index init`` as usual. Indices are stored in the
 ``invenio_search`` schema of ``SQLALCHEMY_DATABASE_URI`` (or
-``SEARCH_PARADEDB_DSN``). Index analyzers are not applied, and queries or
-aggregations the backend does not implement fail with a 400 error.
+``SEARCH_POSTGRES_DSN``). Text search reads postings tables and scores in
+Python, which is meant for thousands of documents, not millions. Queries or
+aggregations the backend does not implement (geo, scripts, highlighting,
+suggesters, point in time) fail with a 400 error instead of returning
+approximate results.
 
 Further documentation is available at https://invenio-search.readthedocs.io/.

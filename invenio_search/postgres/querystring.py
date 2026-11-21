@@ -9,9 +9,14 @@ Produces a small tree that the translator turns into SQL:
 - ``("bool", must, should, must_not)``
 - ``("term", field, value, wildcard)``: in a wildcard value, ``\0`` stands for
   an unescaped ``*`` and ``\1`` for an unescaped ``?``
+- ``("text", field, value)``: consecutive plain words without operators,
+  analyzed together like Lucene does when it does not split on whitespace
 - ``("phrase", field, value)``
 - ``("range", field, low, high, include_low, include_high)``: ``None`` is open
 - ``("exists", field)``
+- ``("fuzzy", field, value, fuzziness)``
+- ``("regexp", field, pattern)``
+- ``("boost", node, factor)``
 
 The occur rules follow Lucene's ``QueryParserBase.addClause``.
 """
@@ -45,8 +50,22 @@ def _tokenize(text):
             i += 1
         elif c in "^~":
             i += 1
+            start = i
             while i < n and (text[i].isdigit() or text[i] == "."):
                 i += 1
+            value = text[start:i]
+            if c == "^":
+                tokens.append(("BOOST", float(value or 1)))
+            else:
+                tokens.append(("FUZZY", value or None))
+        elif c == "/":
+            end = i + 1
+            while end < n and text[end] != "/":
+                end += 2 if text[end] == "\\" else 1
+            if end >= n:
+                raise ParseError("unterminated regular expression")
+            tokens.append(("REGEXP", text[i + 1 : end]))
+            i = end + 1
         elif c == '"':
             i += 1
             buf = []
@@ -133,8 +152,15 @@ class _Parser:
             if kind in ("+", "-", "NOT"):
                 mods = self.take()[0]
             node = self.clause(field)
-            if node is not None:
-                self.add_clause(clauses, conj, mods, node)
+            if node is None:
+                continue
+            plain = conj is None and mods is None and _plain(node)
+            prev = clauses[-1] if clauses else None
+            if plain and prev and prev[2] and prev[1][1] == node[1]:
+                prev[1] = ("text", node[1], f"{prev[1][2]} {node[2]}")
+                continue
+            self.add_clause(clauses, conj, mods, node)
+            clauses[-1].append(plain)
         return self.build(clauses)
 
     def add_clause(self, clauses, conj, mods, node):
@@ -152,6 +178,7 @@ class _Parser:
 
     @staticmethod
     def build(clauses):
+        clauses = [c[:2] for c in clauses]
         if len(clauses) == 1 and clauses[0][0] != MUST_NOT:
             return clauses[0][1]
         if not clauses:
@@ -174,8 +201,23 @@ class _Parser:
             node = self.query(field, nested=True)
             if self.take()[0] != ")":
                 raise ParseError("unbalanced parenthesis")
-            return node
+        else:
+            node = self.atom(kind, value, field)
+        while self.peek()[0] in ("BOOST", "FUZZY"):
+            mod, arg = self.take()
+            if node is None:
+                continue
+            if mod == "BOOST":
+                node = ("boost", node, arg)
+            elif node[0] == "term" and not node[3]:
+                node = ("fuzzy", node[1], node[2], arg if arg is not None else "AUTO")
+            # A phrase slop (``"a b"~2``) is ignored: the phrase must be exact.
+        return node
+
+    def atom(self, kind, value, field):
         self.take()
+        if kind == "REGEXP":
+            return ("regexp", field, value)
         if kind == "PHRASE":
             return ("phrase", field, value)
         if kind == "RANGE":
@@ -195,6 +237,10 @@ class _Parser:
                         return ("range", field, bound, None, op == ">=", False)
                     return ("range", field, None, bound, False, op == "<=")
         return ("term", field, word, wildcard)
+
+
+def _plain(node):
+    return node[0] == "text" or (node[0] == "term" and not node[3])
 
 
 def parse(text, default_operator="OR"):
