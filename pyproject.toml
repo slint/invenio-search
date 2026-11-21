@@ -47,9 +47,6 @@ opensearch2 = [
   "opensearch-dsl>=2.0.0,<3.0.0",
   "opensearch-py>=2.0.0,<3.0.0",
 ]
-postgres = [
-  "psycopg2-binary>=2.9",
-]
 tests = [
   "invenio-db[versioning]>=2.2.0,<3.0.0",
   "mock>=1.3.0",

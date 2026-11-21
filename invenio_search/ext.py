@@ -12,7 +12,7 @@ from importlib.resources import files
 
 import dictdiffer
 from invenio_base.utils import entry_points
-from werkzeug.utils import cached_property, import_string
+from werkzeug.utils import cached_property
 
 from . import config
 from .cli import index as index_cmd
@@ -212,11 +212,7 @@ class _SearchState(object):
 
     def _client_builder(self):
         """Build search engine (ES/OS) client."""
-        client_config = dict(self.app.config.get("SEARCH_CLIENT_CONFIG") or {})
-        connection_class = client_config.get("connection_class")
-        if isinstance(connection_class, str):
-            # Allows setting it from environment variables or invenio.cfg.
-            client_config["connection_class"] = import_string(connection_class)
+        client_config = self.app.config.get("SEARCH_CLIENT_CONFIG") or {}
 
         hosts = self.app.config.get("SEARCH_HOSTS")
         elastic_hosts = self.app.config.get("SEARCH_ELASTIC_HOSTS")
