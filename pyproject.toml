@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 CERN.
+# SPDX-License-Identifier: MIT
+
+[project]
+name = "invenio-search-paradedb"
+description = "Invenio search backend on Postgres with ParadeDB pg_search, for small instances."
+readme = "README.rst"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "CERN", email = "info@inveniosoftware.org" }]
+keywords = ["invenio", "search", "postgres", "paradedb"]
+classifiers = ["Development Status :: 3 - Alpha"]
+dependencies = [
+  "invenio-search[opensearch2]>=3.0.0",
+  "psycopg2-binary>=2.9",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/slint/invenio-search-paradedb"
+
+[project.entry-points."invenio_base.apps"]
+invenio_search_paradedb = "invenio_search_paradedb:InvenioSearchParadeDB"
+
+[project.entry-points."invenio_base.api_apps"]
+invenio_search_paradedb = "invenio_search_paradedb:InvenioSearchParadeDB"
+
+[project.optional-dependencies]
+tests = ["pytest>=7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "invenio_search_paradedb/__init__.py"
