@@ -4,9 +4,9 @@
 """opensearch-py connection class that stores and searches indices in Postgres.
 
 Instead of sending HTTP requests to a cluster, :class:`PostgresConnection`
-answers the OpenSearch REST API calls Invenio makes from a Postgres database.
-All indices share one documents table and its postings and norms tables;
-index metadata, aliases and templates live in small side tables. Requests it
+answers the OpenSearch REST API calls Invenio makes from a Postgres database
+with the ParadeDB ``pg_search`` extension. All indices share one documents
+table with a BM25 index; index metadata, aliases and templates live in small side tables. Requests it
 cannot answer exactly raise a 400 error rather than returning approximate
 results.
 
@@ -14,6 +14,7 @@ It is meant for small instances (local development, demos, test
 environments), not as a replacement for an OpenSearch cluster.
 """
 
+import datetime as dt
 import fnmatch
 import functools
 import json
@@ -24,20 +25,23 @@ from copy import deepcopy
 
 from opensearchpy.connection.base import Connection
 
-from .lucene import encode_norm, f32, shard_of
+from .lucene import f32
 from .query import (
+    DATE_TYPES,
     EPOCH,
+    NUMERIC_TYPES,
+    ROOT,
     Aggregations,
     Fields,
     Translator,
     Unsupported,
     _listify,
     filter_source,
+    leaves,
     parse_date,
+    values_at,
 )
 from .querystring import ParseError
-from .schema import DATES, KEYWORD_LIKE, NUMERIC, DynamicError, Schema, values_at
-from .scoring import Searcher
 
 try:
     import psycopg2 as psycopg
@@ -105,7 +109,7 @@ def _true(value):
 
 
 class PostgresConnection(Connection):
-    """Answer OpenSearch API calls from Postgres.
+    """Answer OpenSearch API calls from Postgres with ParadeDB ``pg_search``.
 
     Enable it with::
 
@@ -160,6 +164,7 @@ class PostgresConnection(Connection):
     def _setup(self, conn):
         s = self.schema
         with conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS pg_search CASCADE")
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {s}")
             cur.execute(
                 f"CREATE TABLE IF NOT EXISTS {s}.indices ("
@@ -181,27 +186,14 @@ class PostgresConnection(Connection):
                 f"CREATE TABLE IF NOT EXISTS {s}.docs ("
                 "pk bigserial PRIMARY KEY, "
                 f"idx text NOT NULL REFERENCES {s}.indices ON DELETE CASCADE, "
-                "id text NOT NULL, version bigint NOT NULL, shard int NOT NULL, "
-                f"seq bigint NOT NULL DEFAULT nextval('{s}.docs_seq'), "
+                "id text NOT NULL, version bigint NOT NULL, "
+                f"seq bigint NOT NULL DEFAULT nextval('{s}.docs_seq'), text text, "
                 "doc jsonb NOT NULL, UNIQUE (idx, id))"
             )
-            # The inverted index: one row per field, term and document.
             cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {s}.terms ("
-                f"pk bigint NOT NULL REFERENCES {s}.docs ON DELETE CASCADE, "
-                "field text NOT NULL, term text NOT NULL, freq int NOT NULL, "
-                "positions jsonb)"
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS terms_term ON {s}.terms (field, term)"
-            )
-            cur.execute(f"CREATE INDEX IF NOT EXISTS terms_pk ON {s}.terms (pk)")
-            # Field lengths for BM25, as Lucene's one-byte norms.
-            cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {s}.norms ("
-                f"pk bigint NOT NULL REFERENCES {s}.docs ON DELETE CASCADE, "
-                "field text NOT NULL, norm smallint, total int NOT NULL, "
-                "PRIMARY KEY (pk, field))"
+                f"CREATE INDEX IF NOT EXISTS docs_bm25 ON {s}.docs "
+                "USING bm25 (pk, text, doc) "
+                "WITH (key_field = 'pk', json_fields = '{\"doc\": {\"fast\": true}}')"
             )
         conn.commit()
 
@@ -619,7 +611,7 @@ class PostgresConnection(Connection):
     # Documents
 
     def _write_index(self, cur, name, cache):
-        """Resolve the index a write to ``name`` goes to: ``{index, schema}``."""
+        """Resolve the index a write to ``name`` goes to: ``{index, text}``."""
         if name in cache:
             return cache[name]
         names, aliases = self._names(cur)
@@ -637,72 +629,25 @@ class PostgresConnection(Connection):
             self._create(cur, name, {})
             index = name
         mappings, settings = self._meta(cur, [index])[index]
-        cache[name] = {"index": index, "schema": Schema(mappings, settings)}
+        cache[name] = {"index": index, "text": _text_spec(mappings, settings)}
         return cache[name]
 
     def _store(self, cur, entry, doc_id, doc, version):
-        """Write a document and its postings. Returns its pk."""
-        schema = entry["schema"]
-        try:
-            new = schema.dynamic(doc)
-        except DynamicError as exc:
-            raise Error(400, "strict_dynamic_mapping_exception", str(exc))
-        if new:
-            mappings = _merge(schema.mappings, {"properties": new})
-            cur.execute(
-                f"UPDATE {self.schema}.indices SET mappings = %s WHERE name = %s",
-                [json.dumps(mappings), entry["index"]],
-            )
-            entry["schema"] = schema = Schema(mappings, schema.settings)
+        """Write a document. Returns its pk."""
         cur.execute(
-            f"INSERT INTO {self.docs} (idx, id, version, shard, doc) "
+            f"INSERT INTO {self.docs} (idx, id, version, text, doc) "
             "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idx, id) DO UPDATE SET "
-            "version = EXCLUDED.version, doc = EXCLUDED.doc, "
+            "version = EXCLUDED.version, text = EXCLUDED.text, doc = EXCLUDED.doc, "
             f"seq = nextval('{self.schema}.docs_seq') RETURNING pk",
             [
                 entry["index"],
                 doc_id,
                 version,
-                shard_of(doc_id, schema.shards),
+                _text(doc, entry["text"]),
                 json.dumps(doc),
             ],
         )
-        pk = cur.fetchone()[0]
-        for table in ("terms", "norms"):
-            cur.execute(f"DELETE FROM {self.schema}.{table} WHERE pk = %s", [pk])
-        postings, norms = schema.terms(schema.with_copies(doc))
-        if postings:
-            cur.execute(
-                f"INSERT INTO {self.schema}.terms "
-                "SELECT %s, f, t, n, p FROM jsonb_to_recordset(%s::jsonb) "
-                "AS x(f text, t text, n int, p jsonb)",
-                [
-                    pk,
-                    json.dumps(
-                        [{"f": f, "t": t, "n": n, "p": p} for f, t, n, p in postings]
-                    ),
-                ],
-            )
-        if norms:
-            cur.execute(
-                f"INSERT INTO {self.schema}.norms "
-                "SELECT %s, f, n, t FROM jsonb_to_recordset(%s::jsonb) "
-                "AS x(f text, n smallint, t int)",
-                [
-                    pk,
-                    json.dumps(
-                        [
-                            {
-                                "f": f,
-                                "n": None if length is None else encode_norm(length),
-                                "t": total,
-                            }
-                            for f, length, total in norms
-                        ]
-                    ),
-                ],
-            )
-        return pk
+        return cur.fetchone()[0]
 
     def _put(self, cur, entry, doc_id, doc, version, version_type, op):
         """Store a document. Returns ``(status, result, version)``."""
@@ -911,29 +856,47 @@ class PostgresConnection(Connection):
             self._resolve(cur, expr, params)
         names = self._resolve(cur, expr, {"ignore_unavailable": "true"})
         meta = self._meta(cur, names)
-        slots, searchers = {}, {}
-        for name in names:
-            mappings, settings = meta[name]
-            searcher = Searcher(
-                cur,
-                self.schema,
-                name,
-                Schema(mappings, settings),
-                Translator(Fields([mappings])),
-            )
-            searcher.percolate = functools.partial(
-                self._percolate, cur, name, meta[name], slots=slots
-            )
-            searchers[name] = searcher
+        fields = Fields([m for m, _ in meta.values()])
+        slots = {}
+        tr = Translator(
+            fields,
+            self.docs,
+            percolate=lambda field, docs: self._percolate(
+                cur, names, meta, field, docs, slots
+            ),
+        )
 
-        # Each index is scored on its own, like OpenSearch scores each shard.
-        def match(query, scoring=True):
-            out = {}
-            for searcher in searchers.values():
-                out.update(searcher.run(query, 1.0, scoring))
-            return out
+        def matching(query):
+            """Pks of the documents matching a query, without scores."""
+            cond, cond_params = Translator(fields, self.docs, tr.percolate).where(
+                query, ROOT, False
+            )
+            cur.execute(
+                f"SELECT d.pk FROM {self.docs} d WHERE d.idx = ANY(%s::text[]) "
+                f"AND COALESCE({cond}, FALSE)",
+                [names] + cond_params,
+            )
+            return {r[0] for r in cur.fetchall()}
 
-        scores = match(body.get("query"))
+        # Text clauses become pg_search BM25 queries; their scores are added up.
+        cond, cond_params = tr.where(body.get("query"))
+        ctes, joins, score_params = [], [], []
+        for n, (expr_sql, p) in enumerate(tr.scoring):
+            ctes.append(
+                f"s{n} AS (SELECT pk, paradedb.score(pk) AS sc FROM {self.docs} "
+                f"WHERE pk @@@ {expr_sql})"
+            )
+            joins.append(f"LEFT JOIN s{n} ON s{n}.pk = d.pk")
+            score_params += p
+        score = " + ".join(f"COALESCE(s{n}.sc, 0)" for n in range(len(ctes)))
+        cur.execute(
+            ("WITH " + ", ".join(ctes) + " " if ctes else "")
+            + f"SELECT d.pk, ({score or '1.0'})::real FROM {self.docs} d "
+            f"{' '.join(joins)} WHERE d.idx = ANY(%s::text[]) "
+            f"AND COALESCE({cond}, FALSE)",
+            score_params + [names] + cond_params,
+        )
+        scores = dict(cur.fetchall())
         shards = {"total": 1, "successful": 1, "skipped": 0, "failed": 0}
         if count:
             return {"count": len(scores), "_shards": shards}
@@ -941,11 +904,7 @@ class PostgresConnection(Connection):
         aggs_spec = body.get("aggs") or body.get("aggregations")
         aggregations = None
         if aggs_spec:
-            aggs = Aggregations(
-                Fields([m for m, _ in meta.values()]),
-                aggs_spec,
-                lambda query: set(match(query, False)),
-            )
+            aggs = Aggregations(fields, aggs_spec, matching)
             select, select_params, keys = aggs.select()
             cur.execute(
                 f"SELECT {select} FROM {self.docs} d WHERE d.pk = ANY(%s::bigint[])",
@@ -955,7 +914,7 @@ class PostgresConnection(Connection):
             aggregations = aggs.compute(rows)
 
         if body.get("post_filter"):
-            keep = match(body["post_filter"], False)
+            keep = matching(body["post_filter"])
             scores = {pk: v for pk, v in scores.items() if pk in keep}
 
         specs = _sort_specs(body.get("sort"))
@@ -964,20 +923,17 @@ class PostgresConnection(Connection):
         )
         need_doc = any(s[0] not in ("_score", "_doc", "_id") for s in specs)
         cur.execute(
-            f"SELECT d.pk, d.idx, d.id, d.seq, d.shard"
+            f"SELECT d.pk, d.idx, d.id, d.seq"
             f"{', d.doc' if need_doc else ''} FROM {self.docs} d "
             "WHERE d.pk = ANY(%s::bigint[])",
             [list(scores)],
         )
         entries = []
         for row in cur.fetchall():
-            pk, idx, doc_id, seq, shard = row[:5]
-            schema = searchers[idx].schema
-            values = [
-                _sort_value(schema, spec, row[5] if need_doc else None, scores[pk], row)
-                for spec in specs
-            ]
-            entries.append((values, (idx, shard, seq), pk, idx, doc_id))
+            pk, idx, doc_id, seq = row[:4]
+            doc = row[4] if need_doc else None
+            values = [_sort_value(fields, spec, doc, scores[pk], row) for spec in specs]
+            entries.append((values, seq, pk, idx, doc_id))
         entries.sort(
             key=functools.cmp_to_key(
                 lambda a, b: (
@@ -1020,13 +976,12 @@ class PostgresConnection(Connection):
                     for v, spec in zip(values, specs)
                 ]
             hits.append(hit)
-        scored = [scores[pk] for pk in scores] if with_score else []
+        scored = list(scores.values()) if with_score else []
         track = body.get("track_total_hits", 10000)
-        relation = "eq"
-        if track is False or track in ("false",):
-            total_hits = None
-        else:
-            limit_total = None if track is True or track == "true" else int(track)
+        total_hits = None
+        if track not in (False, "false"):
+            relation = "eq"
+            limit_total = None if track in (True, "true") else int(track)
             if limit_total is not None and total > limit_total:
                 total, relation = limit_total, "gte"
             total_hits = {"value": total, "relation": relation}
@@ -1045,45 +1000,37 @@ class PostgresConnection(Connection):
             result["aggregations"] = aggregations
         return result
 
-    def _percolate(self, cur, name, meta, field, documents, slots):
-        """Run the queries stored in ``name`` against ``documents``.
-
-        Returns the pks of the matching query documents and records the
-        matching document positions in ``slots``.
-        """
-        schema = Schema(*meta)
-        spec = schema.field(field)
-        if spec is None or spec.type != "percolator":
-            return []
+    def _percolate(self, cur, names, meta, field, documents, slots):
+        """Run stored queries against ``documents``; returns matching query rows."""
         matched = []
         cur.execute("SAVEPOINT percolate")
         try:
-            entry = {"index": name, "schema": schema}
-            temp = [
-                self._store(cur, entry, f"_percolate-{slot}", doc, 1)
-                for slot, doc in enumerate(documents)
-            ]
-            cur.execute(
-                f"SELECT pk, doc -> %s FROM {self.docs} "
-                "WHERE idx = %s AND doc ? %s AND NOT (pk = ANY(%s::bigint[]))",
-                [field, name, field, temp],
-            )
-            stored = cur.fetchall()
-            searcher = Searcher(
-                cur,
-                self.schema,
-                name,
-                entry["schema"],
-                Translator(Fields([entry["schema"].mappings])),
-                restrict=temp,
-            )
-            for pk, query in stored:
-                hit_slots = sorted(
-                    temp.index(p) for p in searcher.run(query, 1.0, False)
+            for name in names:
+                mappings, settings = meta[name]
+                fields = Fields([mappings])
+                if fields.resolve(field)[1] != "percolator":
+                    continue
+                entry = {"index": name, "text": _text_spec(mappings, settings)}
+                temp = [
+                    self._store(cur, entry, f"_percolate-{slot}", doc, 1)
+                    for slot, doc in enumerate(documents)
+                ]
+                cur.execute(
+                    f"SELECT pk, doc -> %s FROM {self.docs} "
+                    "WHERE idx = %s AND doc ? %s AND NOT (pk = ANY(%s::bigint[]))",
+                    [field, name, field, temp],
                 )
-                if hit_slots:
-                    matched.append(pk)
-                    slots[pk] = hit_slots
+                for pk, stored in cur.fetchall():
+                    cond = Translator(fields, self.docs).where(stored)
+                    cur.execute(
+                        f"SELECT d.pk FROM {self.docs} d "
+                        f"WHERE d.pk = ANY(%s::bigint[]) AND COALESCE({cond[0]}, FALSE)",
+                        [temp] + cond[1],
+                    )
+                    hit_slots = sorted(temp.index(r[0]) for r in cur.fetchall())
+                    if hit_slots:
+                        matched.append(pk)
+                        slots[pk] = hit_slots
         finally:
             cur.execute("ROLLBACK TO SAVEPOINT percolate")
         return matched
@@ -1157,7 +1104,7 @@ def _sort_specs(sort):
     return out
 
 
-def _sort_value(schema, spec, doc, score, row):
+def _sort_value(fields, spec, doc, score, row):
     """The value OpenSearch sorts a hit by, as it reports it in ``sort``."""
     field, desc, missing, mode = spec
     if field == "_score":
@@ -1166,23 +1113,20 @@ def _sort_value(schema, spec, doc, score, row):
         return row[3]
     if field == "_id":
         return row[2]
-    f = schema.field(field)
-    kind = f.type if f else None
+    path, kind = fields.resolve(field)
     values = []
-    for value in values_at(doc, f.source if f else field):
+    for value in values_at(doc, path):
         if value is None or isinstance(value, (dict, list)):
             continue
-        if kind in KEYWORD_LIKE:
-            if isinstance(value, bool):
-                value = "true" if value else "false"
-            value = schema.tokens(f, str(value))[0][0]
-        elif kind in DATES:
+        if kind in DATE_TYPES:
             d = parse_date(value)
-            value = int((d - EPOCH).total_seconds() * 1000) if d else None
+            value = (d - EPOCH) // dt.timedelta(milliseconds=1) if d else None
         elif isinstance(value, bool):
-            value = int(value)
-        elif kind in NUMERIC and isinstance(value, str):
+            value = "true" if value else "false" if kind == "keyword" else int(value)
+        elif kind in NUMERIC_TYPES and isinstance(value, str):
             value = float(value) if "." in value else int(value)
+        elif kind == "keyword":
+            value = str(value)
         if value is not None:
             values.append(value)
     if values:
@@ -1193,7 +1137,7 @@ def _sort_value(schema, spec, doc, score, row):
         if mode == "max" or (mode is None and desc):
             return max(values)
         return min(values)
-    if kind in KEYWORD_LIKE or f is None:
+    if kind not in NUMERIC_TYPES | DATE_TYPES | {"boolean"}:
         return None
     return LONG_MAX if desc == (missing == "_first") else LONG_MIN
 
@@ -1217,3 +1161,27 @@ def _java_float(value):
         if f32(short) == value:
             return short
     return value
+
+
+def _text_spec(mappings, settings):
+    """Document paths whose values go into the catch-all text column."""
+    default = settings.get("query.default_field")
+    if not default or default == "*" or default == ["*"]:
+        return None
+    fields = Fields([mappings])
+    return {fields.resolve(f)[0] for f in _listify(default)}
+
+
+def _text(doc, spec):
+    """The catch-all text that unfielded queries search."""
+    values = []
+    for path, value in leaves(doc):
+        if isinstance(value, bool) or value is None:
+            continue
+        if (
+            spec is None
+            or path in spec
+            or any(fnmatch.fnmatchcase(path, p) for p in spec if "*" in p)
+        ):
+            values.append(str(value))
+    return "\n".join(values)

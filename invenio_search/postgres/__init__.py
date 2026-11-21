@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 CERN.
 # SPDX-License-Identifier: MIT
 
-"""Search backend on plain Postgres.
+"""Search backend on Postgres with the ParadeDB ``pg_search`` extension.
 
 For small instances (local development, demos, test environments) that should
 run without an OpenSearch cluster. The client keeps talking the OpenSearch
@@ -16,11 +16,14 @@ it from Postgres instead of sending HTTP requests:
 
 It stores the indices in the ``invenio_search`` schema of the application
 database (``SQLALCHEMY_DATABASE_URI``), or of ``SEARCH_POSTGRES_DSN`` if set.
+The database needs the ``pg_search`` extension, for example from the
+``paradedb/paradedb`` Docker image, and the first connection needs the
+privileges to create it.
 
-Documents are analyzed with the analyzers of the index settings
-(:mod:`.analysis`) into postings tables (:mod:`.schema`), and text queries are
-matched and scored with BM25 per shard like Lucene does (:mod:`.scoring`,
-:mod:`.lucene`). Filters run as exact SQL/JSON path conditions
-(:mod:`.query`). Requests using a query, aggregation or endpoint the backend
-does not implement fail with a 400 error.
+Text queries use ParadeDB's BM25 index with its default tokenizer, not the
+analyzers of the index mappings, so relevance scores and the set of documents
+a text query matches can differ from OpenSearch. Filters, permissions, facets
+and sorting on fields run as exact SQL/JSON path conditions. Requests using a
+query, aggregation or endpoint the backend does not implement fail with a 400
+error.
 """

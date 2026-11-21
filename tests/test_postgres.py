@@ -3,7 +3,7 @@
 
 """Postgres search backend tests.
 
-The backend tests need a Postgres database; set
+The backend tests need Postgres with the ParadeDB ``pg_search`` extension; set
 ``POSTGRES_DSN`` (e.g. ``postgresql://postgres@localhost/test``) to run them.
 """
 
@@ -43,25 +43,12 @@ def test_query_string_parse(query, tree):
     assert parse(query) == tree
 
 
-def test_bm25_matches_lucene():
-    """Score from an OpenSearch ``_explain`` (freq 3, doc length 6, 2 of 30 docs)."""
-    from invenio_search.postgres.lucene import BM25, encode_norm, f32
+def test_terms_partition():
+    """Partitions as OpenSearch assigned them to these keyword terms."""
+    from invenio_search.postgres.query import term_partition
 
-    assert BM25(1, 2, 6, 30).score(3, encode_norm(6)) == f32(0.7052188)
-
-
-def test_edge_ngram_analysis():
-    from invenio_search.postgres.analysis import Analysis
-
-    settings = {
-        "analysis.analyzer.edge.tokenizer": "standard",
-        "analysis.analyzer.edge.filter": ["lowercase", "asciifolding", "ngrams"],
-        "analysis.filter.ngrams.type": "edge_ngram",
-        "analysis.filter.ngrams.min_gram": 2,
-        "analysis.filter.ngrams.max_gram": 4,
-    }
-    terms = [t for t, _ in Analysis(settings).analyzer("edge").tokens("Zürich ETH")]
-    assert terms == ["zu", "zur", "zuri", "et", "eth"]
+    assert [term_partition(str(i), 1) for i in range(3)] == [0, 0, 0]
+    assert {term_partition(str(i), 3) for i in range(30)} == {0, 1, 2}
 
 
 @pytest.fixture()

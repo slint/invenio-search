@@ -19,6 +19,7 @@ import json
 import re
 from fnmatch import fnmatchcase
 
+from . import querystring
 from .lucene import murmur3_32
 
 TEXT_TYPES = {"text", "search_as_you_type", "match_only_text", "completion"}
@@ -129,6 +130,20 @@ def _variants(value):
                 except ValueError:
                     pass
     return out
+
+
+def _distance(fuzziness, text):
+    """Edit distance for a fuzziness setting (``AUTO`` uses the longest word)."""
+    if fuzziness in (None, 0, "0"):
+        return 0
+    spec = str(fuzziness).upper()
+    if spec.startswith("AUTO"):
+        low, high = 3, 6
+        if ":" in spec:
+            low, high = (int(x) for x in spec[5:].split(","))
+        n = max((len(w) for w in _tokens(text)), default=0)
+        return 0 if n < low else 1 if n < high else 2
+    return min(int(float(spec)), 2)
 
 
 def _msm(value, count, default):
@@ -287,13 +302,22 @@ class Fields:
 
 
 class Translator:
-    """Translate filter clauses into SQL conditions on the documents table."""
+    """Translate one search request's queries into SQL conditions."""
 
-    def __init__(self, fields):
-        """Constructor, from the :class:`Fields` of the searched index."""
+    def __init__(self, fields, table, percolate=None):
+        """Constructor.
+
+        :param fields: :class:`Fields` of the searched indices.
+        :param table: name of the documents table.
+        :param percolate: callable ``(field, documents) -> [pk]`` that runs
+            stored percolator queries, or ``None`` when not supported.
+        """
         self.fields = fields
+        self.table = table
+        self.percolate = percolate
+        self.scoring = []
 
-    def where(self, query, ctx=ROOT):
+    def where(self, query, ctx=ROOT, scoring=True):
         """Translate a query clause into an SQL condition."""
         if not query:
             return TRUE
@@ -303,7 +327,7 @@ class Translator:
         method = getattr(self, "_q_" + kind, None)
         if method is None:
             raise Unsupported(f"query [{kind}]")
-        return method(body, ctx)
+        return method(body, ctx, scoring)
 
     @staticmethod
     def _rel(ctx, path):
@@ -319,14 +343,29 @@ class Translator:
             raise Unsupported(f"[{name}] needs exactly one field")
         return items[0]
 
+    def _bm25(self, expr, params, ctx, scoring):
+        if ctx[2]:
+            raise Unsupported("full-text query inside a nested query")
+        if scoring:
+            self.scoring.append((expr, params))
+        return (f"d.pk IN (SELECT pk FROM {self.table} WHERE pk @@@ {expr})", params)
+
     def _exact(self, ctx, path, kind, values):
         if path in ("_id", "_index"):
             if ctx[2]:
                 raise Unsupported(f"[{path}] inside a nested query")
             column = "d.id" if path == "_id" else "d.idx"
             return (f"{column} = ANY(%s::text[])", [[str(v) for v in values]])
-        if kind in TEXT_TYPES:
-            return self._words(ctx, path, [str(v).lower() for v in values], False)
+        if kind in TEXT_TYPES and not ctx[2]:
+            return _join(
+                (
+                    self._bm25(
+                        "paradedb.term(%s, %s)", ["doc." + path, str(v)], ctx, False
+                    )
+                    for v in values
+                ),
+                "OR",
+            )
         variants, seen = [], set()
         for value in values:
             for v in _variants(value):
@@ -359,23 +398,69 @@ class Translator:
         parts = [self._like(ctx, path, f"\\y{_escape_re(w)}\\y", True) for w in words]
         return _join(parts, "AND" if conjunction else "OR")
 
+    def _text_match(self, ctx, column, path, text, conjunction, scoring, fuzzy=None):
+        """Analysed match on the catch-all column (``path=None``) or a field."""
+        if not ctx[2]:
+            distance = _distance(fuzzy, text)
+            return self._bm25(
+                "paradedb.match(%s, %s, conjunction_mode => %s, distance => %s)",
+                [column, str(text), conjunction, distance],
+                ctx,
+                scoring,
+            )
+        return self._words(ctx, path, _tokens(text), conjunction)
+
+    def _prefix(self, ctx, column, path, kind, prefix, scoring):
+        if kind in TEXT_TYPES or path is None:
+            if not ctx[2]:
+                return self._bm25(
+                    "paradedb.phrase_prefix(%s, %s)",
+                    [column, [prefix.lower()]],
+                    ctx,
+                    scoring,
+                )
+            return self._like(ctx, path, f"\\y{_escape_re(prefix)}", True)
+        return self._like(ctx, path, "^" + _escape_re(prefix), False)
+
+    def _phrase(self, ctx, column, path, text, scoring):
+        if not ctx[2]:
+            words = " ".join(_tokens(text))
+            return self._bm25(
+                "paradedb.parse(%s, lenient => true)",
+                [f'{column}:"{words}"'],
+                ctx,
+                scoring,
+            )
+        return self._like(
+            ctx, path, "\\y" + "\\W+".join(map(_escape_re, _tokens(text))) + "\\y", True
+        )
+
+    def _target(self, field):
+        """Return ``(paradedb column, document path, type)`` for a text target."""
+        if field in (None, "*", "_all"):
+            return "text", None, "text"
+        path, kind = self.fields.resolve(field)
+        return "doc." + path, path, kind
+
     # Leaf and compound clauses
 
-    def _q_match_all(self, body, ctx):
+    def _q_match_all(self, body, ctx, scoring):
         return TRUE
 
-    def _q_match_none(self, body, ctx):
+    def _q_match_none(self, body, ctx, scoring):
         return FALSE
 
-    def _q_bool(self, body, ctx):
+    def _q_bool(self, body, ctx, scoring):
         must = _listify(body.get("must"))
         filters = _listify(body.get("filter"))
         should = _listify(body.get("should"))
-        parts = [self.where(q, ctx) for q in must]
-        parts += [self.where(q, ctx) for q in filters]
-        parts += [_not(self.where(q, ctx)) for q in _listify(body.get("must_not"))]
+        parts = [self.where(q, ctx, scoring) for q in must]
+        parts += [self.where(q, ctx, False) for q in filters]
+        parts += [
+            _not(self.where(q, ctx, False)) for q in _listify(body.get("must_not"))
+        ]
         if should:
-            clauses = [self.where(q, ctx) for q in should]
+            clauses = [self.where(q, ctx, scoring) for q in should]
             default = 0 if (must or filters) else 1
             n = _msm(body.get("minimum_should_match"), len(clauses), default)
             if n > len(clauses):
@@ -393,37 +478,45 @@ class Translator:
                 )
         return _join(parts, "AND")
 
-    def _q_constant_score(self, body, ctx):
-        return self.where(body.get("filter"), ctx)
+    def _q_constant_score(self, body, ctx, scoring):
+        return self.where(body.get("filter"), ctx, False)
 
-    def _q_dis_max(self, body, ctx):
-        return _join((self.where(q, ctx) for q in body["queries"]), "OR")
+    def _q_dis_max(self, body, ctx, scoring):
+        return _join((self.where(q, ctx, scoring) for q in body["queries"]), "OR")
 
-    def _q_term(self, body, ctx):
+    def _q_term(self, body, ctx, scoring):
         field, value = self._single(body, "term")
         if isinstance(value, dict):
             value = value["value"]
-        path, kind = self.fields.resolve(field)
-        return self._exact(ctx, path, kind, [value])
+        return self._q_terms({field: [value]}, ctx, scoring)
 
-    def _q_terms(self, body, ctx):
+    def _q_terms(self, body, ctx, scoring):
         field, values = self._single(body, "terms")
         if not isinstance(values, list):
             raise Unsupported("[terms] lookup")
         path, kind = self.fields.resolve(field)
+        if kind in DATE_TYPES:
+            # A date term matches the whole span it denotes, e.g. ``...||/d``.
+            return _join(
+                (
+                    self._q_range({field: {"gte": v, "lte": v}}, ctx, scoring)
+                    for v in values
+                ),
+                "OR",
+            )
         return self._exact(ctx, path, kind, values)
 
-    def _q_ids(self, body, ctx):
+    def _q_ids(self, body, ctx, scoring):
         return self._exact(ctx, "_id", None, _listify(body.get("values")))
 
-    def _q_exists(self, body, ctx):
+    def _q_exists(self, body, ctx, scoring):
         path, _ = self.fields.resolve(body["field"])
         return (
             f"jsonb_path_exists({ctx[0]}, %s::jsonpath)",
             [f"{jsonpath(self._rel(ctx, path))} ? (@ != null)"],
         )
 
-    def _q_range(self, body, ctx):
+    def _q_range(self, body, ctx, scoring):
         field, spec = self._single(body, "range")
         path, kind = self.fields.resolve(field)
         lower = [
@@ -500,64 +593,243 @@ class Translator:
             [each_value(self._rel(ctx, path))] + params,
         )
 
-    def _q_nested(self, body, ctx):
+    def _q_nested(self, body, ctx, scoring):
         path, _ = self.fields.resolve(body["path"])
         alias = f"e{ctx[2] + 1}"
-        inner = self.where(body["query"], (alias, path, ctx[2] + 1))
+        inner = self.where(body["query"], (alias, path, ctx[2] + 1), False)
         return (
             f"EXISTS (SELECT 1 FROM jsonb_path_query({ctx[0]}, %s::jsonpath) {alias} "
             f"WHERE {inner[0]})",
             [each_value(self._rel(ctx, path))] + inner[1],
         )
 
-    # Full-text clauses inside nested queries
-    #
-    # Top-level text queries are scored by :mod:`.scoring` from the postings.
-    # Inside a ``nested`` query they match words case-insensitively in the
-    # nested object's values, without the field's analyzer.
+    # Full-text clauses
 
-    def _text_path(self, field):
-        path, kind = self.fields.resolve(field)
-        if kind is not None and kind not in TEXT_TYPES:
-            return path, kind
-        return path, None
-
-    def _q_match(self, body, ctx):
+    def _q_match(self, body, ctx, scoring):
         field, opts = self._single(body, "match")
         opts = opts if isinstance(opts, dict) else {"query": opts}
-        path, kind = self._text_path(field)
-        if kind is not None:
+        column, path, kind = self._target(field)
+        if path is not None and kind not in TEXT_TYPES and kind is not None:
             return self._exact(ctx, path, kind, [opts["query"]])
         conjunction = str(opts.get("operator", "or")).lower() == "and"
-        return self._words(ctx, path, _tokens(opts["query"]), conjunction)
+        return self._text_match(
+            ctx,
+            column,
+            path,
+            opts["query"],
+            conjunction,
+            scoring,
+            opts.get("fuzziness"),
+        )
 
-    def _q_match_phrase(self, body, ctx):
+    def _q_match_phrase(self, body, ctx, scoring):
         field, opts = self._single(body, "match_phrase")
         opts = opts if isinstance(opts, dict) else {"query": opts}
-        path, kind = self._text_path(field)
-        if kind is not None:
+        column, path, kind = self._target(field)
+        if path is not None and kind not in TEXT_TYPES and kind is not None:
             return self._exact(ctx, path, kind, [opts["query"]])
-        words = "\\W+".join(map(_escape_re, _tokens(opts["query"])))
-        return self._like(ctx, path, f"\\y{words}\\y", True)
+        return self._phrase(ctx, column, path, opts["query"], scoring)
 
-    def _q_prefix(self, body, ctx):
+    def _q_match_phrase_prefix(self, body, ctx, scoring):
+        field, opts = self._single(body, "match_phrase_prefix")
+        opts = opts if isinstance(opts, dict) else {"query": opts}
+        column, path, kind = self._target(field)
+        words = _tokens(opts["query"])
+        if not ctx[2] and words:
+            return self._bm25(
+                "paradedb.phrase_prefix(%s, %s)", [column, words], ctx, scoring
+            )
+        return self._prefix(ctx, column, path, kind, " ".join(words), scoring)
+
+    def _q_prefix(self, body, ctx, scoring):
         field, value = self._single(body, "prefix")
         if isinstance(value, dict):
             value = value["value"]
-        path, kind = self._text_path(field)
-        if kind is None:
-            return self._like(ctx, path, f"\\y{_escape_re(str(value))}", True)
-        return self._like(ctx, path, "^" + _escape_re(str(value)), False)
+        column, path, kind = self._target(field)
+        return self._prefix(ctx, column, path, kind, str(value), scoring)
 
-    def _q_wildcard(self, body, ctx):
+    def _q_wildcard(self, body, ctx, scoring):
         field, value = self._single(body, "wildcard")
         if isinstance(value, dict):
             value = value.get("value", value.get("wildcard"))
         value = str(value).replace("*", "\0").replace("?", "\1")
-        path, kind = self._text_path(field)
-        if kind is None:
-            return self._like(ctx, path, f"\\y{_wild(value)}\\y", True)
-        return self._like(ctx, path, f"^{_wild(value)}$", False)
+        return self._qs_term(field, value, True, ctx, None, scoring)
+
+    def _q_multi_match(self, body, ctx, scoring):
+        fields = body.get("fields") or [None]
+        query = body["query"]
+        kind = body.get("type", "best_fields")
+        conjunction = str(body.get("operator", "or")).lower() == "and"
+        fuzzy = body.get("fuzziness")
+        targets = [self._target(f) for f in fields]
+        if kind in ("phrase", "phrase_prefix"):
+            parts = []
+            for column, path, _ in targets:
+                if kind == "phrase":
+                    parts.append(self._phrase(ctx, column, path, query, scoring))
+                elif not ctx[2]:
+                    parts.append(
+                        self._bm25(
+                            "paradedb.phrase_prefix(%s, %s)",
+                            [column, _tokens(query)],
+                            ctx,
+                            scoring,
+                        )
+                    )
+            return _join(parts, "OR")
+        if kind == "bool_prefix":
+            words = _tokens(query)
+            if not words:
+                return FALSE
+            per_word = []
+            for i, word in enumerate(words):
+                last = i == len(words) - 1
+                alternatives = []
+                for column, path, ftype in targets:
+                    if last:
+                        alternatives.append(
+                            self._prefix(
+                                ctx, column, path, ftype or "text", word, scoring
+                            )
+                        )
+                    else:
+                        alternatives.append(
+                            self._text_match(ctx, column, path, word, False, scoring)
+                        )
+                per_word.append(_join(alternatives, "OR"))
+            return _join(per_word, "AND" if conjunction else "OR")
+        parts = []
+        for column, path, ftype in targets:
+            if path is not None and ftype not in TEXT_TYPES and ftype is not None:
+                parts.append(self._exact(ctx, path, ftype, [query]))
+            else:
+                parts.append(
+                    self._text_match(
+                        ctx, column, path, query, conjunction, scoring, fuzzy
+                    )
+                )
+        return _join(parts, "OR")
+
+    def _q_query_string(self, body, ctx, scoring):
+        fields = body.get("fields") or body.get("default_field")
+        if isinstance(fields, str):
+            fields = [fields]
+        tree = querystring.parse(body["query"], body.get("default_operator", "OR"))
+        return self._qs(tree, ctx, fields, scoring)
+
+    _q_simple_query_string = _q_query_string
+
+    def _qs(self, node, ctx, fields, scoring):
+        kind = node[0]
+        if kind == "all":
+            return TRUE
+        if kind == "bool":
+            _, must, should, must_not = node
+            parts = [self._qs(n, ctx, fields, scoring) for n in must]
+            parts += [_not(self._qs(n, ctx, fields, False)) for n in must_not]
+            if should:
+                clauses = [self._qs(n, ctx, fields, scoring) for n in should]
+                if not must:
+                    parts.append(_join(clauses, "OR"))
+            return _join(parts, "AND") if (parts or not should) else FALSE
+        if kind == "term":
+            _, field, value, wildcard = node
+            targets = [field] if field else (fields or [None])
+            return _join(
+                (
+                    self._qs_term(t, value, wildcard, ctx, fields, scoring)
+                    for t in targets
+                ),
+                "OR",
+            )
+        if kind == "phrase":
+            _, field, value = node
+            parts = []
+            for target in [field] if field else (fields or [None]):
+                column, path, ftype = self._target(target)
+                if path is not None and ftype not in TEXT_TYPES and ftype is not None:
+                    parts.append(self._exact(ctx, path, ftype, [value]))
+                else:
+                    parts.append(self._phrase(ctx, column, path, value, scoring))
+            return _join(parts, "OR")
+        if kind == "range":
+            _, field, low, high, include_low, include_high = node
+            if not field:
+                return FALSE
+            spec = {}
+            if low is not None:
+                spec["gte" if include_low else "gt"] = low
+            if high is not None:
+                spec["lte" if include_high else "lt"] = high
+            return self._q_range({field: spec}, ctx, scoring)
+        if kind == "exists":
+            return self._q_exists({"field": node[1]}, ctx, scoring)
+        if kind == "boost":
+            # Boosts only change scores, which are approximate on this backend.
+            return self._qs(node[1], ctx, fields, scoring)
+        if kind in ("text", "fuzzy", "regexp"):
+            field = node[1]
+            targets = [field] if field else (fields or [None])
+            return _join(
+                (self._qs_other(kind, t, node, ctx, scoring) for t in targets), "OR"
+            )
+        raise Unsupported(f"query string node [{kind}]")
+
+    def _qs_other(self, kind, target, node, ctx, scoring):
+        column, path, ftype = self._target(target)
+        text_like = path is None or ftype in TEXT_TYPES or ftype is None
+        if kind == "text":
+            if text_like:
+                return self._text_match(ctx, column, path, node[2], False, scoring)
+            return self._exact(ctx, path, ftype, [node[2]])
+        if kind == "fuzzy":
+            if text_like and not ctx[2]:
+                return self._bm25(
+                    "paradedb.fuzzy_term(%s, %s, distance => %s)",
+                    [column, str(node[2]).lower(), _distance(node[3], node[2])],
+                    ctx,
+                    scoring,
+                )
+            return self._exact(ctx, path, ftype, [node[2]])
+        if text_like and not ctx[2]:
+            return self._bm25(
+                "paradedb.regex(%s, %s)", [column, str(node[2]).lower()], ctx, scoring
+            )
+        return self._like(ctx, path, f"^({node[2]})$", False)
+
+    def _qs_term(self, target, value, wildcard, ctx, fields, scoring):
+        column, path, kind = self._target(target)
+        text_like = path is None or kind in TEXT_TYPES or kind is None
+        if wildcard:
+            prefix_only = (
+                value.endswith("\0") and "\0" not in value[:-1] and "\1" not in value
+            )
+            if text_like:
+                if prefix_only and value[:-1]:
+                    return self._prefix(ctx, column, path, "text", value[:-1], scoring)
+                if not ctx[2] and path is None:
+                    return self._bm25(
+                        "paradedb.regex(%s, %s)",
+                        [column, _wild(value).lower()],
+                        ctx,
+                        scoring,
+                    )
+                return self._like(ctx, path, f"\\y{_wild(value)}\\y", True)
+            return self._like(ctx, path, f"^{_wild(value)}$", False)
+        if text_like:
+            return self._text_match(ctx, column, path, value, False, scoring)
+        return self._exact(ctx, path, kind, [value])
+
+    def _q_percolate(self, body, ctx, scoring):
+        if self.percolate is None or ctx[2]:
+            raise Unsupported("[percolate] in this context")
+        documents = body.get("documents")
+        if documents is None and "document" in body:
+            documents = [body["document"]]
+        if documents is None:
+            raise Unsupported("[percolate] of indexed documents")
+        pks = self.percolate(body.get("field", "query"), documents)
+        return ("d.pk = ANY(%s::bigint[])", [pks])
 
 
 # Documents
