@@ -18,6 +18,7 @@ import datetime as dt
 import fnmatch
 import functools
 import json
+import re
 import threading
 import time
 import uuid
@@ -37,6 +38,7 @@ from .query import (
     Unsupported,
     _listify,
     filter_source,
+    fold,
     leaves,
     parse_date,
     values_at,
@@ -180,12 +182,12 @@ class ParadeDBConnection(Connection):
                 f"idx text NOT NULL REFERENCES {s}.indices ON DELETE CASCADE, "
                 "id text NOT NULL, version bigint NOT NULL, "
                 f"seq bigint NOT NULL DEFAULT nextval('{s}.docs_seq'), text text, "
-                "doc jsonb NOT NULL, UNIQUE (idx, id))"
+                "doc jsonb NOT NULL, idoc jsonb, UNIQUE (idx, id))"
             )
             cur.execute(
                 f"CREATE INDEX IF NOT EXISTS docs_bm25 ON {s}.docs "
-                "USING bm25 (pk, text, doc) "
-                "WITH (key_field = 'pk', json_fields = '{\"doc\": {\"fast\": true}}')"
+                "USING bm25 (pk, text, idoc) "
+                "WITH (key_field = 'pk', json_fields = '{\"idoc\": {\"fast\": true}}')"
             )
         conn.commit()
 
@@ -621,22 +623,24 @@ class ParadeDBConnection(Connection):
             self._create(cur, name, {})
             index = name
         mappings, settings = self._meta(cur, [index])[index]
-        cache[name] = {"index": index, "text": _text_spec(mappings, settings)}
+        cache[name] = {"index": index, **_analysis(mappings, settings)}
         return cache[name]
 
     def _store(self, cur, entry, doc_id, doc, version):
         """Write a document. Returns its pk."""
         cur.execute(
-            f"INSERT INTO {self.docs} (idx, id, version, text, doc) "
-            "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (idx, id) DO UPDATE SET "
+            f"INSERT INTO {self.docs} (idx, id, version, text, doc, idoc) "
+            "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (idx, id) DO UPDATE SET "
             "version = EXCLUDED.version, text = EXCLUDED.text, doc = EXCLUDED.doc, "
+            "idoc = EXCLUDED.idoc, "
             f"seq = nextval('{self.schema}.docs_seq') RETURNING pk",
             [
                 entry["index"],
                 doc_id,
                 version,
-                _text(doc, entry["text"]),
+                _text(doc, entry["text"], entry["edge"]),
                 json.dumps(doc),
+                json.dumps(_analysed(doc, entry["edge"])),
             ],
         )
         return cur.fetchone()[0]
@@ -1002,7 +1006,7 @@ class ParadeDBConnection(Connection):
                 fields = Fields([mappings])
                 if fields.resolve(field)[1] != "percolator":
                     continue
-                entry = {"index": name, "text": _text_spec(mappings, settings)}
+                entry = {"index": name, **_analysis(mappings, settings)}
                 temp = [
                     self._store(cur, entry, f"_percolate-{slot}", doc, 1)
                     for slot, doc in enumerate(documents)
@@ -1155,17 +1159,79 @@ def _java_float(value):
     return value
 
 
-def _text_spec(mappings, settings):
-    """Document paths whose values go into the catch-all text column."""
+def _analysis(mappings, settings):
+    """What indexing needs from an index's mapping and settings.
+
+    ``text``: document paths for the catch-all column (``None`` for all).
+    ``edge``: paths whose analyzer emits edge n-grams, with ``(min, max)``.
+    """
     default = settings.get("query.default_field")
-    if not default or default == "*" or default == ["*"]:
-        return None
     fields = Fields([mappings])
-    return {fields.resolve(f)[0] for f in _listify(default)}
+    text = None
+    if default and default != "*" and default != ["*"]:
+        text = {fields.resolve(f)[0] for f in _listify(default)}
+    grams = _edge_analyzers(settings)
+    edge = {}
+
+    def walk(props, prefix):
+        for name, spec in (props or {}).items():
+            path = prefix + name
+            if spec.get("type") == "search_as_you_type":
+                continue  # its prefixes come from bool_prefix/phrase_prefix
+            # A multi-field resolves to its parent path, so its n-grams go there.
+            for field in [spec, *(spec.get("fields") or {}).values()]:
+                if field.get("analyzer") in grams:
+                    edge[path] = grams[field["analyzer"]]
+            walk(spec.get("properties"), path + ".")
+
+    walk((mappings or {}).get("properties"), "")
+    return {"text": text, "edge": edge}
 
 
-def _text(doc, spec):
-    """The catch-all text that unfielded queries search."""
+def _edge_analyzers(settings):
+    """``{analyzer: (min_gram, max_gram)}`` for analyzers that edge n-gram."""
+    out = {}
+    for key, value in settings.items():
+        m = re.fullmatch(r"analysis\.analyzer\.([^.]+)\.(filter|tokenizer)", key)
+        if not m:
+            continue
+        for part in _listify(value):
+            base = f"analysis.{m.group(2)}.{part}."
+            if settings.get(base + "type", part) in ("edge_ngram", "edgeNGram"):
+                low = int(settings.get(base + "min_gram", 1))
+                out[m.group(1)] = (low, int(settings.get(base + "max_gram", 2)))
+    return out
+
+
+def _grams(value, span):
+    """Folded ``value`` followed by the edge n-grams of each of its words.
+
+    pg_search tokenises the result into words, so a query word matches a
+    word beginning, as on an OpenSearch edge n-gram field.
+    """
+    low, high = span
+    words = re.findall(r"\w+", value.lower())
+    grams = {w[:n] for w in words for n in range(low, min(high, len(w)) + 1)}
+    return " ".join([value, *sorted(grams - set(words))])
+
+
+def _analysed(doc, edge, prefix=""):
+    """``doc`` as pg_search indexes it: strings folded, n-grams added."""
+    if isinstance(doc, dict):
+        return {
+            k: _analysed(v, edge, f"{prefix}.{k}" if prefix else k)
+            for k, v in doc.items()
+        }
+    if isinstance(doc, list):
+        return [_analysed(v, edge, prefix) for v in doc]
+    if isinstance(doc, str):
+        value = fold(doc)
+        return _grams(value, edge[prefix]) if prefix in edge else value
+    return doc
+
+
+def _text(doc, spec, edge):
+    """The catch-all text that unfielded queries search, folded."""
     values = []
     for path, value in leaves(doc):
         if isinstance(value, bool) or value is None:
@@ -1175,5 +1241,6 @@ def _text(doc, spec):
             or path in spec
             or any(fnmatch.fnmatchcase(path, p) for p in spec if "*" in p)
         ):
-            values.append(str(value))
+            value = fold(str(value))
+            values.append(_grams(value, edge[path]) if path in edge else value)
     return "\n".join(values)

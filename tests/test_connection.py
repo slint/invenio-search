@@ -205,6 +205,73 @@ def test_search(client):
     assert search({"match_all": {}}) == ["1", "2"]
 
 
+EDGE = {
+    "settings": {
+        "analysis": {
+            "analyzer": {
+                "edge": {
+                    "tokenizer": "standard",
+                    "filter": ["lowercase", "asciifolding", "grams"],
+                },
+                "plain": {
+                    "tokenizer": "standard",
+                    "filter": ["lowercase", "asciifolding"],
+                },
+            },
+            "filter": {"grams": {"type": "edge_ngram", "min_gram": 2, "max_gram": 20}},
+        }
+    },
+    "mappings": {
+        "properties": {
+            "name": {"type": "text", "analyzer": "edge", "search_analyzer": "plain"},
+            "place": {"type": "text", "analyzer": "edge", "search_analyzer": "plain"},
+            "note": {"type": "text"},
+        }
+    },
+}
+
+
+def test_accents_and_word_beginnings(client):
+    """Expected hits are what OpenSearch returns for these analyzers."""
+    client.indices.create("v2", body={**EDGE, "aliases": {"names": {}}})
+    # An older index version behind the same alias maps ``place`` as keyword.
+    client.indices.create(
+        "v1",
+        body={
+            "mappings": {"properties": {"place": {"type": "keyword"}}},
+            "aliases": {"names": {}},
+        },
+    )
+    client.index(
+        "v2",
+        id="1",
+        body={"name": "Bonnat, Catherine", "place": "Université de Zürich"},
+    )
+    client.index(
+        "v2", id="2", body={"name": "Hopper, Grace", "place": "CERN", "note": "Café"}
+    )
+    client.indices.refresh("names")
+
+    def find(query, fields, kind="best_fields"):
+        body = {
+            "multi_match": {
+                "query": query,
+                "fields": fields,
+                "type": kind,
+                "operator": "and",
+            }
+        }
+        return ids(client.search(index="names", body={"query": body}))
+
+    assert find("zur", ["place"]) == ["1"]  # word beginning, accent folded
+    assert find("ZÜRICH", ["place"]) == ["1"]
+    assert find("univ", ["place"]) == ["1"]
+    assert find("cafe", ["note"]) == ["2"]  # folded without an edge analyzer
+    assert find("rich", ["place"]) == []  # n-grams start at word beginnings
+    assert find("de bon", ["name", "place"]) == []  # no single field has both
+    assert find("de bon", ["name", "place"], "cross_fields") == ["1"]
+
+
 def test_percolate(client):
     client.indices.create("recs-v1", body=MAPPING)
     client.indices.create(

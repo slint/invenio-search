@@ -17,6 +17,7 @@ import calendar
 import datetime as dt
 import json
 import re
+import unicodedata
 from fnmatch import fnmatchcase
 
 from . import querystring
@@ -88,6 +89,33 @@ def _listify(value):
 
 def _tokens(text):
     return re.findall(r"\w+", str(text).lower())
+
+
+# Letters that Lucene's ASCIIFoldingFilter maps but NFKD doesn't decompose.
+_FOLD = str.maketrans(
+    {
+        "ß": "ss",
+        "ø": "o",
+        "Ø": "O",
+        "æ": "ae",
+        "Æ": "AE",
+        "œ": "oe",
+        "Œ": "OE",
+        "ł": "l",
+        "Ł": "L",
+        "đ": "d",
+        "Đ": "D",
+        "ð": "d",
+        "þ": "th",
+        "ı": "i",
+    }
+)
+
+
+def fold(text):
+    """Strip accents the way OpenSearch's ``asciifolding`` filter does."""
+    text = unicodedata.normalize("NFKD", text.translate(_FOLD))
+    return "".join(c for c in text if not unicodedata.combining(c))
 
 
 def _wild(value):
@@ -285,11 +313,20 @@ class Fields:
         for name, spec in props.items():
             path = prefix + name
             kind = spec.get("type") or ("object" if "properties" in spec else None)
-            self.map.setdefault(path, (path, kind))
+            self._add(path, path, kind)
             for sub, sub_spec in (spec.get("fields") or {}).items():
-                self.map.setdefault(f"{path}.{sub}", (path, sub_spec.get("type")))
+                self._add(f"{path}.{sub}", path, sub_spec.get("type"))
             if "properties" in spec:
                 self._walk(spec["properties"], path + ".")
+
+    def _add(self, name, path, kind):
+        # An alias over index versions can map a field differently (keyword in
+        # v1, text in v2). OpenSearch analyses per index; text keeps the
+        # analysed index's matches, at the cost of looser matching on the other.
+        if name not in self.map or (
+            kind in TEXT_TYPES and self.map[name][1] not in TEXT_TYPES
+        ):
+            self.map[name] = (path, kind)
 
     def resolve(self, field):
         """Return ``(document path, mapping type)`` for a field name."""
@@ -346,6 +383,16 @@ class Translator:
     def _bm25(self, expr, params, ctx, scoring):
         if ctx[2]:
             raise Unsupported("full-text query inside a nested query")
+        # Indexed text is folded (see ``connection._analysed``), so fold the
+        # query values too; column names are ASCII and pass through.
+        params = [
+            fold(p)
+            if isinstance(p, str)
+            else [fold(x) for x in p]
+            if isinstance(p, list)
+            else p
+            for p in params
+        ]
         if scoring:
             self.scoring.append((expr, params))
         return (f"d.pk IN (SELECT pk FROM {self.table} WHERE pk @@@ {expr})", params)
@@ -360,7 +407,7 @@ class Translator:
             return _join(
                 (
                     self._bm25(
-                        "paradedb.term(%s, %s)", ["doc." + path, str(v)], ctx, False
+                        "paradedb.term(%s, %s)", ["idoc." + path, str(v)], ctx, False
                     )
                     for v in values
                 ),
@@ -440,7 +487,7 @@ class Translator:
         if field in (None, "*", "_all"):
             return "text", None, "text"
         path, kind = self.fields.resolve(field)
-        return "doc." + path, path, kind
+        return "idoc." + path, path, kind
 
     # Leaf and compound clauses
 
@@ -698,6 +745,16 @@ class Translator:
                         )
                 per_word.append(_join(alternatives, "OR"))
             return _join(per_word, "AND" if conjunction else "OR")
+        if kind == "cross_fields":
+            # Each word may match a different field ("Bonnat, Université de ...").
+            words = _tokens(query)
+            per_word = [
+                self._q_multi_match(
+                    {**body, "query": word, "type": "best_fields"}, ctx, scoring
+                )
+                for word in words
+            ]
+            return _join(per_word, "AND" if conjunction else "OR") if words else FALSE
         parts = []
         for column, path, ftype in targets:
             if path is not None and ftype not in TEXT_TYPES and ftype is not None:
