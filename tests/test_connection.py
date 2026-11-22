@@ -272,6 +272,37 @@ def test_accents_and_word_beginnings(client):
     assert find("de bon", ["name", "place"], "cross_fields") == ["1"]
 
 
+def test_exists_needs_a_value(client):
+    """As on OpenSearch, empty objects and arrays don't exist."""
+    client.indices.create(
+        "ex",
+        body={
+            "mappings": {
+                "properties": {
+                    "parent": {"properties": {"ids": {"type": "keyword"}}},
+                    "tags": {"type": "keyword"},
+                }
+            }
+        },
+    )
+    docs = {
+        "empty-obj": {"parent": {}, "tags": []},
+        "empty-ids": {"parent": {"ids": []}, "tags": [None]},
+        "filled": {"parent": {"ids": ["c1"]}, "tags": [""]},
+    }
+    for doc_id, doc in docs.items():
+        client.index("ex", id=doc_id, body=doc)
+    client.indices.refresh("ex")
+
+    def find(query):
+        return ids(client.search(index="ex", body={"query": query}))
+
+    assert find({"exists": {"field": "parent"}}) == ["filled"]
+    assert find({"exists": {"field": "parent.ids"}}) == ["filled"]
+    assert find({"exists": {"field": "tags"}}) == ["filled"]  # "" is a value
+    assert find({"query_string": {"query": "_exists_:parent"}}) == ["filled"]
+
+
 def test_percolate(client):
     client.indices.create("recs-v1", body=MAPPING)
     client.indices.create(

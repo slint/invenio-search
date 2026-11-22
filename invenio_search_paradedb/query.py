@@ -558,9 +558,14 @@ class Translator:
 
     def _q_exists(self, body, ctx, scoring):
         path, _ = self.fields.resolve(body["field"])
+        # OpenSearch matches only indexed values, so an object or array counts
+        # when some value under it is a non-null scalar ({} and [] don't).
         return (
             f"jsonb_path_exists({ctx[0]}, %s::jsonpath)",
-            [f"{jsonpath(self._rel(ctx, path))} ? (@ != null)"],
+            [
+                f"{jsonpath(self._rel(ctx, path))}.** ? (@ != null && "
+                '@.type() != "object" && @.type() != "array")'
+            ],
         )
 
     def _q_range(self, body, ctx, scoring):
